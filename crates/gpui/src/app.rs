@@ -1575,8 +1575,7 @@ impl App {
     fn apply_refresh_effect(&mut self) {
         for window in self.windows.values_mut() {
             if let Some(window) = window.as_deref_mut() {
-                window.refreshing = true;
-                window.invalidator.set_dirty(true);
+                window.refresh();
             }
         }
     }

@@ -1,14 +1,16 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, DevicePixels, GpuSpecs,
+    MonochromeSprite, OffscreenSurface, OffscreenSurfaceId, Path, Point, PolychromeSprite,
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, TileId, Underline,
+    get_gamma_correction_ratios, point, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -116,10 +118,11 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
+    path_intermediate_texture: Option<Arc<wgpu::Texture>>,
+    path_intermediate_view: Option<Arc<wgpu::TextureView>>,
+    path_msaa_texture: Option<Arc<wgpu::Texture>>,
+    path_msaa_view: Option<Arc<wgpu::TextureView>>,
+    offscreen_surfaces: HashMap<OffscreenSurfaceId, OffscreenRenderTarget>,
 }
 
 impl WgpuResources {
@@ -129,6 +132,26 @@ impl WgpuResources {
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
     }
+}
+
+struct OffscreenRenderTarget {
+    #[allow(dead_code)]
+    texture: Arc<wgpu::Texture>,
+    view: Arc<wgpu::TextureView>,
+    #[allow(dead_code)]
+    path_intermediate_texture: Arc<wgpu::Texture>,
+    path_intermediate_view: Arc<wgpu::TextureView>,
+    #[allow(dead_code)]
+    path_msaa_texture: Option<Arc<wgpu::Texture>>,
+    path_msaa_view: Option<Arc<wgpu::TextureView>>,
+    size: Size<DevicePixels>,
+}
+
+struct RenderTargetViews {
+    view: Arc<wgpu::TextureView>,
+    path_intermediate_view: Arc<wgpu::TextureView>,
+    path_msaa_view: Option<Arc<wgpu::TextureView>>,
+    size: Size<DevicePixels>,
 }
 
 pub struct WgpuRenderer {
@@ -463,6 +486,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            offscreen_surfaces: HashMap::default(),
         };
 
         Ok(Self {
@@ -895,8 +919,8 @@ impl WgpuRenderer {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+    ) -> (Arc<wgpu::Texture>, Arc<wgpu::TextureView>) {
+        let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("path_intermediate"),
             size: wgpu::Extent3d {
                 width: width.max(1),
@@ -909,8 +933,8 @@ impl WgpuRenderer {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        }));
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
         (texture, view)
     }
 
@@ -920,11 +944,11 @@ impl WgpuRenderer {
         width: u32,
         height: u32,
         sample_count: u32,
-    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+    ) -> Option<(Arc<wgpu::Texture>, Arc<wgpu::TextureView>)> {
         if sample_count <= 1 {
             return None;
         }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("path_msaa"),
             size: wgpu::Extent3d {
                 width: width.max(1),
@@ -937,9 +961,53 @@ impl WgpuRenderer {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        }));
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
         Some((texture, view))
+    }
+
+    fn create_offscreen_render_target(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        target_size: Size<DevicePixels>,
+        path_sample_count: u32,
+    ) -> OffscreenRenderTarget {
+        let width = (target_size.width.0 as u32).max(1);
+        let height = (target_size.height.0 as u32).max(1);
+        let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_surface"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        }));
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let (path_intermediate_texture, path_intermediate_view) =
+            Self::create_path_intermediate(device, format, width, height);
+        let (path_msaa_texture, path_msaa_view) =
+            Self::create_msaa_if_needed(device, format, width, height, path_sample_count)
+                .map(|(texture, view)| (Some(texture), Some(view)))
+                .unwrap_or((None, None));
+
+        OffscreenRenderTarget {
+            texture,
+            view,
+            path_intermediate_texture,
+            path_intermediate_view,
+            path_msaa_texture,
+            path_msaa_view,
+            size: size(DevicePixels(width as i32), DevicePixels(height as i32)),
+        }
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -1147,73 +1215,69 @@ impl WgpuRenderer {
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
 
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let gamma_params = GammaParams {
-            gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
-            is_bgr: self.is_bgr as u32,
-            _pad: 0,
-        };
-
-        let globals = GlobalParams {
-            viewport_size: [
-                self.surface_config.width as f32,
-                self.surface_config.height as f32,
-            ],
-            premultiplied_alpha: if self.surface_config.alpha_mode
-                == wgpu::CompositeAlphaMode::PreMultiplied
-            {
-                1
-            } else {
-                0
-            },
-            pad: 0,
-        };
-
-        let path_globals = GlobalParams {
-            premultiplied_alpha: 0,
-            ..globals
-        };
-
-        {
-            let resources = self.resources();
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                0,
-                bytemuck::bytes_of(&globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.path_globals_offset,
-                bytemuck::bytes_of(&path_globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.gamma_offset,
-                bytemuck::bytes_of(&gamma_params),
-            );
+        if !self.prepare_offscreen_surfaces(scene) {
+            self.needs_redraw = true;
+            return false;
         }
+
+        let mut live_offscreen_surfaces = HashSet::new();
+        Self::collect_offscreen_surface_ids(scene, &mut live_offscreen_surfaces);
+        self.resources_mut()
+            .offscreen_surfaces
+            .retain(|id, _| live_offscreen_surfaces.contains(id));
+
+        let frame_view = Arc::new(
+            frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+        );
+        let target_size = size(
+            DevicePixels(self.surface_config.width as i32),
+            DevicePixels(self.surface_config.height as i32),
+        );
+        let target_views = RenderTargetViews {
+            view: frame_view,
+            path_intermediate_view: self
+                .resources()
+                .path_intermediate_view
+                .as_ref()
+                .expect("path intermediate texture was initialized")
+                .clone(),
+            path_msaa_view: self.resources().path_msaa_view.clone(),
+            size: target_size,
+        };
+        let rendered = self.render_scene_to_view(scene, &target_views, target_size, "main");
+        if rendered {
+            frame.present();
+        } else {
+            self.needs_redraw = true;
+        }
+        rendered
+    }
+
+    fn render_scene_to_view(
+        &mut self,
+        scene: &Scene,
+        target: &RenderTargetViews,
+        target_size: Size<DevicePixels>,
+        label: &'static str,
+    ) -> bool {
+        self.write_global_params(target_size);
 
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
 
-            let mut encoder =
-                self.resources()
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("main_encoder"),
-                    });
+            let mut encoder = self
+                .resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("main_pass"),
+                    label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: target.view.as_ref(),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1246,13 +1310,15 @@ impl WgpuRenderer {
                             let did_draw = self.draw_paths_to_intermediate(
                                 &mut encoder,
                                 paths,
+                                target.path_intermediate_view.as_ref(),
+                                target.path_msaa_view.as_deref(),
                                 &mut instance_offset,
                             );
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("main_pass_continued"),
+                                label: Some(label),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: target.view.as_ref(),
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1267,6 +1333,7 @@ impl WgpuRenderer {
                             if did_draw {
                                 self.draw_paths_from_intermediate(
                                     paths,
+                                    target.path_intermediate_view.as_ref(),
                                     &mut instance_offset,
                                     &mut pass,
                                 )
@@ -1305,6 +1372,11 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::OffscreenSurfaces(range) => self.draw_offscreen_surfaces(
+                            &scene.offscreen_surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -1320,8 +1392,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
-                    return true;
+                    return false;
                 }
                 self.grow_instance_buffer();
                 continue;
@@ -1330,8 +1401,186 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
             return true;
+        }
+    }
+
+    fn write_global_params(&self, target_size: Size<DevicePixels>) {
+        let gamma_params = GammaParams {
+            gamma_ratios: self.rendering_params.gamma_ratios,
+            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
+            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
+            is_bgr: self.is_bgr as u32,
+            _pad: 0,
+        };
+
+        let globals = GlobalParams {
+            viewport_size: [target_size.width.0 as f32, target_size.height.0 as f32],
+            premultiplied_alpha: if self.surface_config.alpha_mode
+                == wgpu::CompositeAlphaMode::PreMultiplied
+            {
+                1
+            } else {
+                0
+            },
+            pad: 0,
+        };
+
+        let path_globals = GlobalParams {
+            premultiplied_alpha: 0,
+            ..globals
+        };
+
+        let resources = self.resources();
+        resources
+            .queue
+            .write_buffer(&resources.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        resources.queue.write_buffer(
+            &resources.globals_buffer,
+            self.path_globals_offset,
+            bytemuck::bytes_of(&path_globals),
+        );
+        resources.queue.write_buffer(
+            &resources.globals_buffer,
+            self.gamma_offset,
+            bytemuck::bytes_of(&gamma_params),
+        );
+    }
+
+    fn collect_offscreen_surface_ids(scene: &Scene, ids: &mut HashSet<OffscreenSurfaceId>) {
+        for surface in &scene.offscreen_surfaces {
+            ids.insert(surface.id);
+            if let Some(scene) = surface.scene.as_deref() {
+                Self::collect_offscreen_surface_ids(scene, ids);
+            }
+        }
+    }
+
+    fn prepare_offscreen_surfaces(&mut self, scene: &Scene) -> bool {
+        let surfaces = scene.offscreen_surfaces.clone();
+        for surface in surfaces {
+            let Some(surface_scene) = surface.scene.as_deref() else {
+                continue;
+            };
+            if !self.prepare_offscreen_surfaces(surface_scene) {
+                return false;
+            }
+            let target = self.ensure_offscreen_surface(surface.id, surface.size);
+            if !self.render_scene_to_view(surface_scene, &target, target.size, "offscreen") {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn ensure_offscreen_surface(
+        &mut self,
+        id: OffscreenSurfaceId,
+        requested_size: Size<DevicePixels>,
+    ) -> RenderTargetViews {
+        let target_size = self.clamp_render_target_size(requested_size);
+        let format = self.surface_config.format;
+        let path_sample_count = self.rendering_params.path_sample_count;
+        let resources = self.resources_mut();
+
+        let needs_create = resources
+            .offscreen_surfaces
+            .get(&id)
+            .map_or(true, |target| target.size != target_size);
+        if needs_create {
+            resources.offscreen_surfaces.insert(
+                id,
+                Self::create_offscreen_render_target(
+                    &resources.device,
+                    format,
+                    target_size,
+                    path_sample_count,
+                ),
+            );
+        }
+
+        let target = resources
+            .offscreen_surfaces
+            .get(&id)
+            .expect("offscreen surface was just created");
+        RenderTargetViews {
+            view: target.view.clone(),
+            path_intermediate_view: target.path_intermediate_view.clone(),
+            path_msaa_view: target.path_msaa_view.clone(),
+            size: target.size,
+        }
+    }
+
+    fn clamp_render_target_size(&self, requested_size: Size<DevicePixels>) -> Size<DevicePixels> {
+        size(
+            DevicePixels(
+                requested_size
+                    .width
+                    .0
+                    .max(1)
+                    .min(self.max_texture_size as i32),
+            ),
+            DevicePixels(
+                requested_size
+                    .height
+                    .0
+                    .max(1)
+                    .min(self.max_texture_size as i32),
+            ),
+        )
+    }
+
+    fn draw_offscreen_surfaces(
+        &mut self,
+        surfaces: &[OffscreenSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        for surface in surfaces {
+            let Some(target) = self.resources().offscreen_surfaces.get(&surface.id) else {
+                self.needs_redraw = true;
+                return false;
+            };
+            let sprite = Self::offscreen_surface_sprite(surface, target.size);
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
+            if !self.draw_instances_with_texture(
+                data,
+                1,
+                target.view.as_ref(),
+                &self.resources().pipelines.poly_sprites,
+                instance_offset,
+                pass,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn offscreen_surface_sprite(
+        surface: &OffscreenSurface,
+        target_size: Size<DevicePixels>,
+    ) -> PolychromeSprite {
+        PolychromeSprite {
+            order: surface.order,
+            pad: 0,
+            grayscale: false,
+            opacity: 1.0,
+            bounds: surface.bounds,
+            content_mask: surface.content_mask,
+            corner_radii: Default::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(DevicePixels(0), DevicePixels(0)),
+                    size: target_size,
+                },
+            },
         }
     }
 
@@ -1533,6 +1782,7 @@ impl WgpuRenderer {
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        path_intermediate_view: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
@@ -1553,17 +1803,12 @@ impl WgpuRenderer {
             vec![PathSprite { bounds }]
         };
 
-        let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return true;
-        };
-
         let sprite_data = unsafe { Self::instance_bytes(&sprites) };
         self.draw_instances_with_texture(
             sprite_data,
             sprites.len() as u32,
             path_intermediate_view,
-            &resources.pipelines.paths,
+            &self.resources().pipelines.paths,
             instance_offset,
             pass,
         )
@@ -1573,6 +1818,8 @@ impl WgpuRenderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        path_intermediate_view: &wgpu::TextureView,
+        path_msaa_view: Option<&wgpu::TextureView>,
         instance_offset: &mut u64,
     ) -> bool {
         let mut vertices = Vec::new();
@@ -1609,11 +1856,7 @@ impl WgpuRenderer {
                 }],
             });
 
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return true;
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
+        let (target_view, resolve_target) = if let Some(msaa_view) = path_msaa_view {
             (msaa_view, Some(path_intermediate_view))
         } else {
             (path_intermediate_view, None)

@@ -5,14 +5,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -36,6 +37,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub offscreen_surfaces: Vec<OffscreenSurface>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +54,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.offscreen_surfaces.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +122,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::OffscreenSurface(surface) => {
+                surface.order = order;
+                self.offscreen_surfaces.push(surface.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +153,53 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.offscreen_surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    pub fn translate(&mut self, delta: Point<ScaledPixels>) {
+        for operation in &mut self.paint_operations {
+            match operation {
+                PaintOperation::Primitive(primitive) => primitive.translate(delta),
+                PaintOperation::StartLayer(bounds) => *bounds = *bounds + delta,
+                PaintOperation::EndLayer => {}
+            }
+        }
+
+        for shadow in &mut self.shadows {
+            shadow.bounds = shadow.bounds + delta;
+            shadow.content_mask.bounds = shadow.content_mask.bounds + delta;
+        }
+        for quad in &mut self.quads {
+            quad.bounds = quad.bounds + delta;
+            quad.content_mask.bounds = quad.content_mask.bounds + delta;
+        }
+        for path in &mut self.paths {
+            path.translate(delta);
+        }
+        for underline in &mut self.underlines {
+            underline.bounds = underline.bounds + delta;
+            underline.content_mask.bounds = underline.content_mask.bounds + delta;
+        }
+        for sprite in &mut self.monochrome_sprites {
+            sprite.bounds = sprite.bounds + delta;
+            sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+        }
+        for sprite in &mut self.subpixel_sprites {
+            sprite.bounds = sprite.bounds + delta;
+            sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+        }
+        for sprite in &mut self.polychrome_sprites {
+            sprite.bounds = sprite.bounds + delta;
+            sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+        }
+        for surface in &mut self.surfaces {
+            surface.bounds = surface.bounds + delta;
+            surface.content_mask.bounds = surface.content_mask.bounds + delta;
+        }
+        for surface in &mut self.offscreen_surfaces {
+            surface.bounds = surface.bounds + delta;
+            surface.content_mask.bounds = surface.content_mask.bounds + delta;
+        }
     }
 
     #[cfg_attr(
@@ -173,6 +227,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            offscreen_surfaces_start: 0,
+            offscreen_surfaces_iter: self.offscreen_surfaces.iter().peekable(),
         }
     }
 }
@@ -195,6 +251,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    OffscreenSurface,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +271,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    OffscreenSurface(OffscreenSurface),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +286,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::OffscreenSurface(surface) => &surface.bounds,
         }
     }
 
@@ -241,6 +300,45 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::OffscreenSurface(surface) => &surface.content_mask,
+        }
+    }
+
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        match self {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = shadow.bounds + delta;
+                shadow.content_mask.bounds = shadow.content_mask.bounds + delta;
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = quad.bounds + delta;
+                quad.content_mask.bounds = quad.content_mask.bounds + delta;
+            }
+            Primitive::Path(path) => path.translate(delta),
+            Primitive::Underline(underline) => {
+                underline.bounds = underline.bounds + delta;
+                underline.content_mask.bounds = underline.content_mask.bounds + delta;
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + delta;
+                sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = sprite.bounds + delta;
+                sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + delta;
+                sprite.content_mask.bounds = sprite.content_mask.bounds + delta;
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = surface.bounds + delta;
+                surface.content_mask.bounds = surface.content_mask.bounds + delta;
+            }
+            Primitive::OffscreenSurface(surface) => {
+                surface.bounds = surface.bounds + delta;
+                surface.content_mask.bounds = surface.content_mask.bounds + delta;
+            }
         }
     }
 }
@@ -269,6 +367,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    offscreen_surfaces_start: usize,
+    offscreen_surfaces_iter: Peekable<slice::Iter<'a, OffscreenSurface>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +401,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.offscreen_surfaces_iter.peek().map(|s| s.order),
+                PrimitiveKind::OffscreenSurface,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +551,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::OffscreenSurface => {
+                let surfaces_start = self.offscreen_surfaces_start;
+                let mut surfaces_end = surfaces_start + 1;
+                self.offscreen_surfaces_iter.next();
+                while self
+                    .offscreen_surfaces_iter
+                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    surfaces_end += 1;
+                }
+                self.offscreen_surfaces_start = surfaces_end;
+                Some(PrimitiveBatch::OffscreenSurfaces(
+                    surfaces_start..surfaces_end,
+                ))
+            }
         }
     }
 }
@@ -479,6 +599,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    OffscreenSurfaces(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -731,6 +852,27 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(missing_docs)]
+pub struct OffscreenSurfaceId(pub u64);
+
+#[derive(Clone)]
+#[expect(missing_docs)]
+pub struct OffscreenSurface {
+    pub order: DrawOrder,
+    pub id: OffscreenSurfaceId,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub size: Size<DevicePixels>,
+    pub scene: Option<Arc<Scene>>,
+}
+
+impl From<OffscreenSurface> for Primitive {
+    fn from(surface: OffscreenSurface) -> Self {
+        Primitive::OffscreenSurface(surface)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(missing_docs)]
 pub struct PathId(pub usize);
@@ -871,6 +1013,19 @@ where
     #[expect(missing_docs)]
     pub fn clipped_bounds(&self) -> Bounds<T> {
         self.bounds.intersect(&self.content_mask.bounds)
+    }
+}
+
+impl Path<ScaledPixels> {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        self.bounds = self.bounds + delta;
+        self.content_mask.bounds = self.content_mask.bounds + delta;
+        self.start += delta;
+        self.current += delta;
+        for vertex in &mut self.vertices {
+            vertex.xy_position += delta;
+            vertex.content_mask.bounds = vertex.content_mask.bounds + delta;
+        }
     }
 }
 

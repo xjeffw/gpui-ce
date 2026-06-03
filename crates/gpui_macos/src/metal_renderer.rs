@@ -1096,6 +1096,7 @@ impl MetalRenderer {
                     }
                     true
                 }
+                PrimitiveBatch::OffscreenSurfaces(_range) => true,
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             };
             if !ok {

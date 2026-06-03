@@ -8,17 +8,18 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
     GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, OffscreenSurface,
+    OffscreenSurfaceId, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1012,6 +1013,8 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    /// Set by `Window::refresh` so cached offscreen targets are rebuilt on a full refresh.
+    refresh_offscreen_surfaces: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1706,6 +1709,7 @@ impl Window {
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            refresh_offscreen_surfaces: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -1843,6 +1847,7 @@ impl Window {
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
+            self.refresh_offscreen_surfaces = true;
             self.invalidator.set_dirty(true);
         }
     }
@@ -2674,6 +2679,7 @@ impl Window {
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
+        self.refresh_offscreen_surfaces = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
@@ -4227,6 +4233,84 @@ impl Window {
             content_mask,
             texture,
             texture_size,
+        });
+    }
+
+    /// Paint a scene into a cached offscreen target, then composite that target into this frame.
+    ///
+    /// The paint closure is only invoked when `dirty` is true. The closure should paint using the
+    /// window's normal absolute coordinate space; GPUI translates the captured scene into
+    /// texture-local coordinates before handing it to the platform renderer.
+    pub fn paint_offscreen(
+        &mut self,
+        id: OffscreenSurfaceId,
+        bounds: Bounds<Pixels>,
+        dirty: bool,
+        paint: impl FnOnce(&mut Self),
+    ) {
+        self.paint_offscreen_with_opacity(id, bounds, dirty, 1.0, paint);
+    }
+
+    /// Paint a scene into a cached offscreen target, then composite that target into this frame
+    /// with the given opacity.
+    ///
+    /// The opacity is applied when the cached offscreen texture is composited into the parent
+    /// scene. It does not affect the paint closure, and changing only this opacity does not require
+    /// `dirty` to be true.
+    pub fn paint_offscreen_with_opacity(
+        &mut self,
+        id: OffscreenSurfaceId,
+        bounds: Bounds<Pixels>,
+        dirty: bool,
+        opacity: f32,
+        paint: impl FnOnce(&mut Self),
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let snapped_bounds = self.cover_bounds(bounds);
+        if snapped_bounds.is_empty() {
+            return;
+        }
+
+        let target_size = size(
+            DevicePixels(snapped_bounds.size.width.0.ceil().max(1.) as i32),
+            DevicePixels(snapped_bounds.size.height.0.ceil().max(1.) as i32),
+        );
+        let content_mask = self.snapped_content_mask();
+        let dirty = dirty || self.refresh_offscreen_surfaces;
+
+        let scene = if dirty {
+            let offscreen_mask = ContentMask {
+                bounds: bounds.intersect(&self.content_mask().bounds),
+            };
+            let saved_content_masks =
+                mem::replace(&mut self.content_mask_stack, vec![offscreen_mask]);
+            let main_scene = mem::take(&mut self.next_frame.scene);
+
+            paint(self);
+
+            let mut offscreen_scene = mem::take(&mut self.next_frame.scene);
+            self.next_frame.scene = main_scene;
+            self.content_mask_stack = saved_content_masks;
+
+            offscreen_scene.translate(point(
+                ScaledPixels(-snapped_bounds.origin.x.0),
+                ScaledPixels(-snapped_bounds.origin.y.0),
+            ));
+            offscreen_scene.finish();
+            Some(Arc::new(offscreen_scene))
+        } else {
+            None
+        };
+
+        self.next_frame.scene.insert_primitive(OffscreenSurface {
+            order: 0,
+            id,
+            bounds: snapped_bounds,
+            content_mask,
+            size: target_size,
+            opacity,
+            scene,
         });
     }
 

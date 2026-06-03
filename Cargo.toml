@@ -11,6 +11,8 @@ members = [
   "./crates/gpui_platform/",
   "./crates/gpui_shared_string/",
   "./crates/gpui_elements/",
+  "./crates/stacksafe/",
+  "./crates/stacksafe-macro/",
   "./tooling/perf/",
 ]
 default-members = ["./crates/gpui/"]
@@ -71,7 +73,9 @@ serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
 slotmap = "1.0.6"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 async-channel = "2.5.0"
-stacksafe = "1.0"
+stacker = "0.1.23"
+stacksafe = { path = "./crates/stacksafe", version = "1.0.1" }
+stacksafe-macro = { path = "./crates/stacksafe-macro", version = "=1.0.1" }
 strum = { version = "0.27.2", features = ["derive"] }
 sum_tree = { git = "https://github.com/zed-industries/zed", rev = "876ec5a8a074ba83cce2129ed4d76b59c05a37e9" }
 thiserror = "2.0.12"

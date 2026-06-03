@@ -5418,21 +5418,17 @@ dependencies = [
 
 [[package]]
 name = "stacksafe"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b738765988c43975135c78ade8b0ee940566ab87d7e324897662b7460c44ab83"
+version = "1.0.1"
 dependencies = [
+ "serde",
  "stacker",
  "stacksafe-macro",
 ]
 
 [[package]]
 name = "stacksafe-macro"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e30778b21fdee0c7dbfcf5cfc2d9e2a0dbc135faf7093c245bf19f088f9fa10"
+version = "1.0.1"
 dependencies = [
- "proc-macro2",
  "quote",
  "syn",
 ]

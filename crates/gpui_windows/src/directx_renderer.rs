@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use ::util::ResultExt;
 use anyhow::{Context, Result};
+use util::ResultExt;
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -558,6 +558,7 @@ impl DirectXRenderer {
                         Ok(())
                     }
                 }
+                PrimitiveBatch::OffscreenSurfaces(_range) => Ok(()),
             }
             .context(format!(
                 "scene too large:\

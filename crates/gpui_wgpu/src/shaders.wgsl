@@ -1312,6 +1312,23 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }
 
+@fragment
+fn fs_offscreen_surface(input: PolySpriteVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let sprite = b_poly_sprites[input.sprite_id];
+    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let alpha_factor = sprite.opacity * saturate(0.5 - distance);
+
+    // Offscreen render targets contain premultiplied source-over results. Preserve that
+    // representation when applying composite opacity.
+    return vec4<f32>(sample.rgb * alpha_factor, sample.a * alpha_factor);
+}
+
 // --- surfaces --- //
 
 struct SurfaceParams {

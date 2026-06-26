@@ -864,6 +864,7 @@ pub struct OffscreenSurface {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub size: Size<DevicePixels>,
+    pub opacity: f32,
     pub scene: Option<Arc<Scene>>,
 }
 

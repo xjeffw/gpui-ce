@@ -4069,6 +4069,23 @@ impl Window {
         dirty: bool,
         paint: impl FnOnce(&mut Self),
     ) {
+        self.paint_offscreen_with_opacity(id, bounds, dirty, 1.0, paint);
+    }
+
+    /// Paint a scene into a cached offscreen target, then composite that target into this frame
+    /// with the given opacity.
+    ///
+    /// The opacity is applied when the cached offscreen texture is composited into the parent
+    /// scene. It does not affect the paint closure, and changing only this opacity does not require
+    /// `dirty` to be true.
+    pub fn paint_offscreen_with_opacity(
+        &mut self,
+        id: OffscreenSurfaceId,
+        bounds: Bounds<Pixels>,
+        dirty: bool,
+        opacity: f32,
+        paint: impl FnOnce(&mut Self),
+    ) {
         self.invalidator.debug_assert_paint();
 
         let snapped_bounds = self.cover_bounds(bounds);
@@ -4113,6 +4130,7 @@ impl Window {
             bounds: snapped_bounds,
             content_mask,
             size: target_size,
+            opacity,
             scene,
         });
     }

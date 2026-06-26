@@ -92,6 +92,7 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    offscreen_surfaces: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -889,6 +890,22 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let offscreen_surfaces = create_pipeline(
+            "offscreen_surfaces",
+            "vs_poly_sprite",
+            "fs_offscreen_surface",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -910,6 +927,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            offscreen_surfaces,
             surfaces,
         }
     }
@@ -1547,7 +1565,7 @@ impl WgpuRenderer {
                 data,
                 1,
                 target.view.as_ref(),
-                &self.resources().pipelines.poly_sprites,
+                &self.resources().pipelines.offscreen_surfaces,
                 instance_offset,
                 pass,
             ) {
@@ -1565,7 +1583,7 @@ impl WgpuRenderer {
             order: surface.order,
             pad: 0,
             grayscale: false,
-            opacity: 1.0,
+            opacity: surface.opacity,
             bounds: surface.bounds,
             content_mask: surface.content_mask,
             corner_radii: Default::default(),

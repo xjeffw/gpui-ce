@@ -731,6 +731,22 @@ fragment float4 polychrome_sprite_fragment(
   return color;
 }
 
+fragment float4 offscreen_surface_fragment(
+    PolychromeSpriteFragmentInput input [[stage_in]],
+    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> offscreen_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+  PolychromeSprite sprite = sprites[input.sprite_id];
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 sample = offscreen_texture.sample(texture_sampler, input.tile_position);
+  float distance =
+      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+  float alpha_factor = sprite.opacity * saturate(0.5 - distance);
+
+  // Offscreen render targets contain premultiplied source-over results. Preserve that
+  // representation when applying composite opacity.
+  return float4(sample.rgb * alpha_factor, sample.a * alpha_factor);
+}
+
 struct PathRasterizationVertexOutput {
   float4 position [[position]];
   float2 st_position;

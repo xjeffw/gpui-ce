@@ -6,10 +6,12 @@ use cocoa::{
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
+use collections::{FxHashMap, FxHashSet};
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, FilterBoundary,
-    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    ScaledFilter, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, ContentMask, Corners,
+    DevicePixels, FilterBoundary, MonochromeSprite, OffscreenSurface, OffscreenSurfaceId,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledFilter, ScaledPixels,
+    Scene, Shadow, Size, Surface, TileId, Underline, point, size,
 };
 
 /// The largest blur radius in a scene-space filter chain, in device pixels — used to size the
@@ -142,6 +144,7 @@ pub(crate) struct MetalRenderer {
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    offscreen_surfaces_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     // Blur pipelines: downsample (no blend, also used for the final blit), separable gaussian
     // (no blend), and composite (alpha blend into a rounded rect). See `shaders.metal`.
@@ -158,6 +161,7 @@ pub(crate) struct MetalRenderer {
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
     // passes can sample already-painted content), the half-res ping/pong blur targets, and a
     // full-res target for content-filter groups.
+    blur_target_size: Option<Size<DevicePixels>>,
     scene_color_texture: Option<metal::Texture>,
     blur_ping_texture: Option<metal::Texture>,
     blur_pong_texture: Option<metal::Texture>,
@@ -166,7 +170,23 @@ pub(crate) struct MetalRenderer {
     /// nested content blurs isolate correctly, up to [`MAX_FILTER_DEPTH`]; deeper nests render
     /// inline.
     group_textures: Vec<metal::Texture>,
+    offscreen_surfaces: FxHashMap<OffscreenSurfaceId, OffscreenRenderTarget>,
     path_sample_count: u32,
+}
+
+#[derive(Clone)]
+struct OffscreenRenderTarget {
+    texture: metal::Texture,
+    path_intermediate_texture: metal::Texture,
+    path_intermediate_msaa_texture: Option<metal::Texture>,
+    size: Size<DevicePixels>,
+}
+
+struct RenderTarget<'a> {
+    texture: &'a metal::TextureRef,
+    path_intermediate_texture: &'a metal::TextureRef,
+    path_intermediate_msaa_texture: Option<&'a metal::TextureRef>,
+    size: Size<DevicePixels>,
 }
 
 /// Mirrors the `BlurParams` struct in `shaders.metal`. Passed to the blur pipelines via
@@ -392,6 +412,14 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let offscreen_surfaces_pipeline_state = build_premultiplied_pipeline_state(
+            &device,
+            &library,
+            "offscreen_surfaces",
+            "polychrome_sprite_vertex",
+            "offscreen_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -447,6 +475,7 @@ impl MetalRenderer {
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
+            offscreen_surfaces_pipeline_state,
             surfaces_pipeline_state,
             blur_downsample_pipeline_state,
             blur_pipeline_state,
@@ -457,10 +486,12 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            blur_target_size: None,
             scene_color_texture: None,
             blur_ping_texture: None,
             blur_pong_texture: None,
             group_textures: Vec::new(),
+            offscreen_surfaces: FxHashMap::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -510,6 +541,7 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.blur_target_size = None;
             self.scene_color_texture = None;
             self.blur_ping_texture = None;
             self.blur_pong_texture = None;
@@ -517,6 +549,16 @@ impl MetalRenderer {
             return;
         }
 
+        let (path_intermediate_texture, path_intermediate_msaa_texture) =
+            self.create_path_intermediate_textures(size);
+        self.path_intermediate_texture = Some(path_intermediate_texture);
+        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
+    }
+
+    fn create_path_intermediate_textures(
+        &self,
+        size: Size<DevicePixels>,
+    ) -> (metal::Texture, Option<metal::Texture>) {
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
@@ -524,30 +566,9 @@ impl MetalRenderer {
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+        let path_intermediate_texture = self.device.new_texture(&texture_descriptor);
 
-        // Full-res scene + group targets, and half-res ping/pong blur targets.
-        let make_color_texture = |width: u64, height: u64| {
-            let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_width(width.max(1));
-            descriptor.set_height(height.max(1));
-            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            descriptor.set_usage(
-                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-            );
-            self.device.new_texture(&descriptor)
-        };
-        let full_w = size.width.0 as u64;
-        let full_h = size.height.0 as u64;
-        self.scene_color_texture = Some(make_color_texture(full_w, full_h));
-        self.group_textures = (0..MAX_FILTER_DEPTH)
-            .map(|_| make_color_texture(full_w, full_h))
-            .collect();
-        self.blur_ping_texture = Some(make_color_texture(full_w / 2, full_h / 2));
-        self.blur_pong_texture = Some(make_color_texture(full_w / 2, full_h / 2));
-
-        if self.path_sample_count > 1 {
+        let path_intermediate_msaa_texture = if self.path_sample_count > 1 {
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
             // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
             let storage_mode = if self.is_apple_gpu {
@@ -560,10 +581,82 @@ impl MetalRenderer {
             msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
             msaa_descriptor.set_storage_mode(storage_mode);
             msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
+            Some(self.device.new_texture(&msaa_descriptor))
         } else {
-            self.path_intermediate_msaa_texture = None;
+            None
+        };
+
+        (path_intermediate_texture, path_intermediate_msaa_texture)
+    }
+
+    fn create_color_texture(&self, size: Size<DevicePixels>) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0.max(1) as u64);
+        descriptor.set_height(size.height.0.max(1) as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.device.new_texture(&descriptor)
+    }
+
+    fn ensure_blur_textures(&mut self, target_size: Size<DevicePixels>) {
+        if self.blur_target_size == Some(target_size) {
+            return;
         }
+
+        let half_size = size(
+            DevicePixels((target_size.width.0 / 2).max(1)),
+            DevicePixels((target_size.height.0 / 2).max(1)),
+        );
+        self.scene_color_texture = Some(self.create_color_texture(target_size));
+        self.blur_ping_texture = Some(self.create_color_texture(half_size));
+        self.blur_pong_texture = Some(self.create_color_texture(half_size));
+        self.group_textures = (0..MAX_FILTER_DEPTH)
+            .map(|_| self.create_color_texture(target_size))
+            .collect();
+        self.blur_target_size = Some(target_size);
+    }
+
+    fn clamp_render_target_size(&self, requested_size: Size<DevicePixels>) -> Size<DevicePixels> {
+        // All macOS Metal GPU families support 16,384 pixels per 2D texture dimension.
+        const MAX_TEXTURE_SIZE: i32 = 16_384;
+        size(
+            DevicePixels(requested_size.width.0.clamp(1, MAX_TEXTURE_SIZE)),
+            DevicePixels(requested_size.height.0.clamp(1, MAX_TEXTURE_SIZE)),
+        )
+    }
+
+    fn ensure_offscreen_surface(
+        &mut self,
+        id: OffscreenSurfaceId,
+        requested_size: Size<DevicePixels>,
+    ) -> OffscreenRenderTarget {
+        let target_size = self.clamp_render_target_size(requested_size);
+        let needs_create = self
+            .offscreen_surfaces
+            .get(&id)
+            .is_none_or(|target| target.size != target_size);
+
+        if needs_create {
+            let texture = self.create_color_texture(target_size);
+            let (path_intermediate_texture, path_intermediate_msaa_texture) =
+                self.create_path_intermediate_textures(target_size);
+            self.offscreen_surfaces.insert(
+                id,
+                OffscreenRenderTarget {
+                    texture,
+                    path_intermediate_texture,
+                    path_intermediate_msaa_texture,
+                    size: target_size,
+                },
+            );
+        }
+
+        self.offscreen_surfaces
+            .get(&id)
+            .expect("offscreen surface was just created")
+            .clone()
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -888,8 +981,116 @@ impl MetalRenderer {
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
+
+        self.prepare_offscreen_surfaces(
+            scene,
+            instance_buffer,
+            &mut instance_offset,
+            command_buffer,
+        )?;
+
+        let mut live_offscreen_surfaces = FxHashSet::default();
+        Self::collect_offscreen_surface_ids(scene, &mut live_offscreen_surfaces);
+        self.offscreen_surfaces
+            .retain(|id, _| live_offscreen_surfaces.contains(id));
+
+        let path_intermediate_texture = self
+            .path_intermediate_texture
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("path intermediate texture was not initialized"))?;
+        let path_intermediate_msaa_texture = self.path_intermediate_msaa_texture.clone();
+        let target = RenderTarget {
+            texture,
+            path_intermediate_texture: &path_intermediate_texture,
+            path_intermediate_msaa_texture: path_intermediate_msaa_texture.as_deref(),
+            size: viewport_size,
+        };
+        self.render_scene_to_texture(
+            scene,
+            &target,
+            instance_buffer,
+            &mut instance_offset,
+            command_buffer,
+            if self.opaque { 1. } else { 0. },
+        )?;
+
+        if !self.is_unified_memory {
+            // Sync the instance buffer to the GPU
+            instance_buffer.metal_buffer.did_modify_range(NSRange {
+                location: 0,
+                length: instance_offset as NSUInteger,
+            });
+        }
+
+        Ok(command_buffer.to_owned())
+    }
+
+    fn collect_offscreen_surface_ids(scene: &Scene, ids: &mut FxHashSet<OffscreenSurfaceId>) {
+        for surface in &scene.offscreen_surfaces {
+            ids.insert(surface.id);
+            if let Some(scene) = surface.scene.as_deref() {
+                Self::collect_offscreen_surface_ids(scene, ids);
+            }
+        }
+    }
+
+    fn prepare_offscreen_surfaces(
+        &mut self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        for surface in scene.offscreen_surfaces.clone() {
+            let Some(surface_scene) = surface.scene.as_deref() else {
+                continue;
+            };
+
+            self.prepare_offscreen_surfaces(
+                surface_scene,
+                instance_buffer,
+                instance_offset,
+                command_buffer,
+            )?;
+
+            let target = self.ensure_offscreen_surface(surface.id, surface.size);
+            let render_target = RenderTarget {
+                texture: &target.texture,
+                path_intermediate_texture: &target.path_intermediate_texture,
+                path_intermediate_msaa_texture: target.path_intermediate_msaa_texture.as_deref(),
+                size: target.size,
+            };
+            self.render_scene_to_texture(
+                surface_scene,
+                &render_target,
+                instance_buffer,
+                instance_offset,
+                command_buffer,
+                0.,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene_to_texture(
+        &mut self,
+        scene: &Scene,
+        target: &RenderTarget<'_>,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_buffer: &metal::CommandBufferRef,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        let viewport_size = target.size;
+        let texture = target.texture;
+        let use_offscreen =
+            !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
+        if use_offscreen {
+            self.ensure_blur_textures(viewport_size);
+        }
 
         // Render the scene into an offscreen color texture (so filters can sample it), then
         // blit it to `texture`. Owned clones keep the textures borrowable without borrowing
@@ -897,8 +1098,6 @@ impl MetalRenderer {
         // Only route through the offscreen scene texture when the scene actually contains blur
         // filters; otherwise render straight to `texture` exactly as before (no regression, no
         // extra blit for the common case).
-        let use_offscreen =
-            !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
         let scene_color_owned = self.scene_color_texture.clone();
         let blur_ping_owned = self.blur_ping_texture.clone();
         let blur_pong_owned = self.blur_pong_texture.clone();
@@ -919,7 +1118,12 @@ impl MetalRenderer {
             viewport_size,
             |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                color_attachment.set_clear_color(metal::MTLClearColor::new(
+                    0.,
+                    0.,
+                    0.,
+                    clear_alpha,
+                ));
             },
         );
 
@@ -928,14 +1132,14 @@ impl MetalRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     &scene.shadows[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -945,8 +1149,10 @@ impl MetalRenderer {
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        target.path_intermediate_texture,
+                        target.path_intermediate_msaa_texture,
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_buffer,
                     );
@@ -963,8 +1169,9 @@ impl MetalRenderer {
                     if did_draw {
                         self.draw_paths_from_intermediate(
                             paths,
+                            target.path_intermediate_texture,
                             instance_buffer,
-                            &mut instance_offset,
+                            instance_offset,
                             viewport_size,
                             command_encoder,
                         )
@@ -975,7 +1182,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(
                     &scene.underlines[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -984,7 +1191,7 @@ impl MetalRenderer {
                         texture_id,
                         &scene.monochrome_sprites[range],
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_encoder,
                     ),
@@ -993,14 +1200,14 @@ impl MetalRenderer {
                         texture_id,
                         &scene.polychrome_sprites[range],
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -1096,7 +1303,13 @@ impl MetalRenderer {
                     }
                     true
                 }
-                PrimitiveBatch::OffscreenSurfaces(_range) => true,
+                PrimitiveBatch::OffscreenSurfaces(range) => self.draw_offscreen_surfaces(
+                    &scene.offscreen_surfaces[range],
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             };
             if !ok {
@@ -1129,15 +1342,7 @@ impl MetalRenderer {
             );
         }
 
-        if !self.is_unified_memory {
-            // Sync the instance buffer to the GPU
-            instance_buffer.metal_buffer.did_modify_range(NSRange {
-                location: 0,
-                length: instance_offset as NSUInteger,
-            });
-        }
-
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     /// Run a single blur pass: draw a full-screen (or composite) quad sampling `source` into
@@ -1307,6 +1512,8 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        intermediate_texture: &metal::TextureRef,
+        msaa_texture: Option<&metal::TextureRef>,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1315,9 +1522,6 @@ impl MetalRenderer {
         if paths.is_empty() {
             return true;
         }
-        let Some(intermediate_texture) = &self.path_intermediate_texture else {
-            return false;
-        };
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -1327,7 +1531,7 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = msaa_texture {
             color_attachment.set_texture(Some(msaa_texture));
             color_attachment.set_resolve_texture(Some(intermediate_texture));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
@@ -1515,6 +1719,7 @@ impl MetalRenderer {
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        intermediate_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1522,10 +1727,6 @@ impl MetalRenderer {
     ) -> bool {
         let Some(first_path) = paths.first() else {
             return true;
-        };
-
-        let Some(ref intermediate_texture) = self.path_intermediate_texture else {
-            return false;
         };
 
         command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
@@ -1748,17 +1949,39 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
+        let texture = self.sprite_atlas.metal_texture(texture_id);
+        self.draw_polychrome_sprites_with_texture(
+            sprites,
+            &texture,
+            &self.polychrome_sprites_pipeline_state,
+            instance_buffer,
+            instance_offset,
+            viewport_size,
+            command_encoder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_polychrome_sprites_with_texture(
+        &self,
+        sprites: &[PolychromeSprite],
+        texture: &metal::TextureRef,
+        pipeline: &metal::RenderPipelineState,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
         if sprites.is_empty() {
             return true;
         }
         align_offset(instance_offset);
 
-        let texture = self.sprite_atlas.metal_texture(texture_id);
         let texture_size = size(
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1784,7 +2007,7 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+        command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(texture));
 
         let sprite_bytes_len = mem::size_of_val(sprites);
         let buffer_contents =
@@ -1811,6 +2034,61 @@ impl MetalRenderer {
         );
         *instance_offset = next_offset;
         true
+    }
+
+    fn draw_offscreen_surfaces(
+        &self,
+        surfaces: &[OffscreenSurface],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        for surface in surfaces {
+            let Some(target) = self.offscreen_surfaces.get(&surface.id) else {
+                return false;
+            };
+            let sprite = Self::offscreen_surface_sprite(surface, target.size);
+            if !self.draw_polychrome_sprites_with_texture(
+                std::slice::from_ref(&sprite),
+                &target.texture,
+                &self.offscreen_surfaces_pipeline_state,
+                instance_buffer,
+                instance_offset,
+                viewport_size,
+                command_encoder,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn offscreen_surface_sprite(
+        surface: &OffscreenSurface,
+        target_size: Size<DevicePixels>,
+    ) -> PolychromeSprite {
+        PolychromeSprite {
+            order: surface.order,
+            pad: 0,
+            grayscale: false,
+            opacity: surface.opacity,
+            bounds: surface.bounds,
+            content_mask: surface.content_mask,
+            corner_radii: Default::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(DevicePixels(0), DevicePixels(0)),
+                    size: target_size,
+                },
+            },
+        }
     }
 
     fn draw_surfaces(
@@ -2047,6 +2325,40 @@ fn build_path_rasterization_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_premultiplied_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 // Blur downsample/gaussian passes overwrite their target (no blending). The composite pass
 // uses the normal alpha-blending pipeline (`build_pipeline_state`) instead.
 fn build_blur_pipeline_state(
@@ -2167,5 +2479,77 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn red_scene(size_in_pixels: f32) -> Scene {
+        let bounds = scaled_bounds(0., 0., size_in_pixels, size_in_pixels);
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::red().into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    fn scene_with_offscreen_surface(
+        id: OffscreenSurfaceId,
+        scene: Option<Arc<Scene>>,
+        opacity: f32,
+    ) -> Scene {
+        let bounds = scaled_bounds(8., 8., 16., 16.);
+        let mut outer = Scene::default();
+        outer.insert_primitive(OffscreenSurface {
+            order: 0,
+            id,
+            bounds,
+            content_mask: ContentMask {
+                bounds: scaled_bounds(0., 0., 32., 32.),
+            },
+            size: size(DevicePixels(16), DevicePixels(16)),
+            opacity,
+            scene,
+        });
+        outer.finish();
+        outer
+    }
+
+    #[test]
+    fn renders_and_reuses_cached_offscreen_surface() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.opaque = false;
+        let id = OffscreenSurfaceId(42);
+        let frame_size = size(DevicePixels(32), DevicePixels(32));
+
+        let first_scene = scene_with_offscreen_surface(id, Some(Arc::new(red_scene(16.))), 0.5);
+        let first_image = renderer
+            .render_scene_to_image(&first_scene, frame_size)
+            .unwrap();
+        let first_pixel = first_image.get_pixel(12, 12).0;
+        assert!((first_pixel[0] as i16 - 128).abs() <= 1);
+        assert!((first_pixel[3] as i16 - 128).abs() <= 1);
+        assert_eq!(&first_pixel[1..3], &[0, 0]);
+
+        let cached_scene = scene_with_offscreen_surface(id, None, 1.0);
+        let cached_image = renderer
+            .render_scene_to_image(&cached_scene, frame_size)
+            .unwrap();
+        assert_eq!(cached_image.get_pixel(12, 12).0, [255, 0, 0, 255]);
+        assert_eq!(cached_image.get_pixel(2, 2).0, [0, 0, 0, 0]);
     }
 }

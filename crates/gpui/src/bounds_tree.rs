@@ -38,6 +38,20 @@ where
     search_stack: Vec<NonNull<Node<U>>>,
 }
 
+impl<U: Clone + Debug + Default + PartialEq> Clone for BoundsTree<U> {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            root: self.root,
+            max_leaf: self.max_leaf,
+            order_floor: self.order_floor,
+            insert_path: Vec::new(),
+            // Traversal pointers belong to the original allocation and must not be copied.
+            search_stack: Vec::new(),
+        }
+    }
+}
+
 /// A node in the bounds tree.
 #[derive(Debug, Clone)]
 struct Node<U>

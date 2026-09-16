@@ -2721,7 +2721,9 @@ impl Window {
     pub(crate) fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "input-latency-histogram")]
-        self.input_latency_tracker.record_frame_presented();
+        if self.platform_window.last_frame_presented() {
+            self.input_latency_tracker.record_frame_presented();
+        }
         // A renderer can decline a frame (swapchain out of date, acquire timed out, surface
         // occluded) without reporting an error. Keep the frame pending so the next request
         // presents it again and `draw` knows its offscreen captures are still undelivered.

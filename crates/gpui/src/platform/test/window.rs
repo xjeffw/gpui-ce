@@ -34,6 +34,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    pub(crate) present_frames: bool,
 }
 
 #[derive(Clone)]
@@ -86,6 +87,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            present_frames: true,
         })))
     }
 
@@ -292,6 +294,10 @@ impl PlatformWindow for TestWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, _scene: &Scene) {}
+
+    fn last_frame_presented(&self) -> bool {
+        self.0.lock().present_frames
+    }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()

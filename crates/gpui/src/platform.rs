@@ -664,7 +664,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    /// Whether the scene given to the most recent [`PlatformWindow::draw`] reached the display.
+    /// Whether the renderer accepted the most recent [`PlatformWindow::draw`] for presentation.
     ///
     /// Platforms whose renderer can decline a frame without an error report `false` so the
     /// window presents the frame again instead of treating its contents as shown.

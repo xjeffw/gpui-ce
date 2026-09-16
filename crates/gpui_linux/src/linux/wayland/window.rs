@@ -1420,6 +1420,7 @@ impl PlatformWindow for WaylandWindow {
             }
 
             state.force_render_after_recovery = true;
+            state.renderer_presented = false;
             return;
         }
 

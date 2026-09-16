@@ -354,7 +354,7 @@ mod tests {
     use super::*;
     use crate::{
         AppContext, InteractiveElement, MouseButton, ParentElement, Styled, TestAppContext,
-        VisualTestContext, div, px, rgb,
+        VisualContext, VisualTestContext, div, px, rgb,
     };
 
     struct SurfaceContent {
@@ -511,6 +511,43 @@ mod tests {
                 !surface_captured(window),
                 "once presented, unchanged frames composite the texture again"
             );
+        });
+    }
+
+    #[crate::test]
+    fn declined_frame_keeps_offscreen_capture_pending_until_presented(cx: &mut TestAppContext) {
+        let (root, cx) = cx.add_window_view(|_, cx| SurfaceRoot {
+            content: cx.new(|_| SurfaceContent { clicks: 0 }),
+            width: 300.,
+        });
+        cx.run_until_parked();
+        present(cx);
+        let platform_window = cx.test_window(cx.window_handle());
+        let content = root.read_with(cx, |root, _| root.content.clone());
+        cx.update(|window, cx| {
+            content.update(cx, |content, cx| {
+                content.clicks += 1;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+            platform_window.0.lock().present_frames = false;
+            window.present();
+            assert!(window.needs_present.get());
+            // More input and animation can replace even a declined frame repeatedly.
+            for _ in 0..3 {
+                root.update(cx, |_, cx| cx.notify());
+                let _ = window.draw(cx);
+                assert!(surface_captured(window));
+                window.present();
+                assert!(window.needs_present.get());
+            }
+            // A successful retry need not draw again to deliver the pending capture.
+            platform_window.0.lock().present_frames = true;
+            window.present();
+            assert!(!window.needs_present.get());
+            root.update(cx, |_, cx| cx.notify());
+            let _ = window.draw(cx);
+            assert!(!surface_captured(window));
         });
     }
 }

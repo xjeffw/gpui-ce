@@ -24,7 +24,7 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -215,7 +215,7 @@ impl Scene {
 
     /// Carries captured offscreen scenes forward from a frame that was never presented.
     ///
-    /// [`Window::paint_offscreen`] captures a surface's scene only when its caller reports the
+    /// [`crate::Window::paint_offscreen`] captures a surface's scene only when its caller reports the
     /// surface dirty; callers then treat that capture as painted and give later frames
     /// `scene: None` so the renderer composites its cached texture. If the frame holding the
     /// capture is replaced before the renderer sees it (a draw that refreshes the dispatch
@@ -227,21 +227,36 @@ impl Scene {
             let Some(previous) = unpresented
                 .offscreen_surfaces
                 .iter()
-                .find(|previous| previous.id == surface.id && previous.size == surface.size)
+                .find(|previous| previous.id == surface.id)
             else {
                 continue;
             };
             match (&mut surface.scene, &previous.scene) {
-                (None, Some(scene)) => surface.scene = Some(Arc::clone(scene)),
+                (None, Some(scene)) if previous.size == surface.size => {
+                    surface.scene = Some(Arc::clone(scene));
+                }
                 (Some(scene), Some(previous_scene)) => {
-                    // A fresh capture can itself hold surfaces painted with `dirty = false`.
-                    // A capture replayed from the unpresented frame shares its `Arc` and
-                    // already carries everything it needs.
-                    if let Some(scene) = Arc::get_mut(scene) {
-                        scene.inherit_offscreen_scenes(previous_scene);
+                    // Fresh captures are shared with paint_operations too, so get_mut would
+                    // skip their nested surfaces. A replay of the same capture already has
+                    // everything it needs; otherwise preserve the old scene via copy-on-write.
+                    if !scene.offscreen_surfaces.is_empty() && !Arc::ptr_eq(scene, previous_scene) {
+                        Arc::make_mut(scene).inherit_offscreen_scenes(previous_scene);
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Cached elements replay paint_operations rather than the renderer's sorted arrays.
+        // Keep both representations current so a later replay cannot lose these captures.
+        for operation in &mut self.paint_operations {
+            if let PaintOperation::Primitive(Primitive::OffscreenSurface(surface)) = operation
+                && let Some(updated) = self
+                    .offscreen_surfaces
+                    .iter()
+                    .find(|updated| updated.id == surface.id && updated.size == surface.size)
+            {
+                surface.scene = updated.scene.clone();
             }
         }
     }
@@ -363,6 +378,7 @@ pub(crate) enum PrimitiveKind {
     FilterBoundaryEnd,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -1311,6 +1327,82 @@ mod tests {
         ContentMask {
             bounds: full_bounds(),
         }
+    }
+
+    fn offscreen(id: u64, scene: Option<Arc<Scene>>) -> OffscreenSurface {
+        OffscreenSurface {
+            order: 0,
+            id: OffscreenSurfaceId(id),
+            bounds: full_bounds(),
+            content_mask: mask(),
+            size: crate::size(DevicePixels(100), DevicePixels(100)),
+            opacity: 1.0,
+            scene,
+        }
+    }
+
+    #[test]
+    fn inherited_offscreen_capture_survives_replay_and_yields_to_new_content() {
+        let capture = Arc::new(Scene::default());
+        let mut previous = Scene::default();
+        previous.insert_primitive(offscreen(1, Some(capture.clone())));
+        let mut next = Scene::default();
+        next.insert_primitive(offscreen(1, None));
+        next.inherit_offscreen_scenes(&previous);
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..next.len(), &next);
+        assert!(Arc::ptr_eq(
+            replayed.offscreen_surfaces[0].scene.as_ref().unwrap(),
+            &capture,
+        ));
+
+        let newer = Arc::new(Scene::default());
+        let mut changed = Scene::default();
+        changed.insert_primitive(offscreen(1, Some(newer.clone())));
+        changed.inherit_offscreen_scenes(&next);
+        assert!(Arc::ptr_eq(
+            changed.offscreen_surfaces[0].scene.as_ref().unwrap(),
+            &newer,
+        ));
+
+        let mut resized = Scene::default();
+        let mut surface = offscreen(1, None);
+        surface.size.width = DevicePixels(200);
+        resized.insert_primitive(surface);
+        resized.inherit_offscreen_scenes(&next);
+        assert!(resized.offscreen_surfaces[0].scene.is_none());
+    }
+
+    #[test]
+    fn fresh_parent_capture_inherits_unpresented_child_without_changing_shared_scene() {
+        let capture = Arc::new(Scene::default());
+        let mut previous_parent = Scene::default();
+        previous_parent.insert_primitive(offscreen(2, Some(capture.clone())));
+        let mut previous = Scene::default();
+        previous.insert_primitive(offscreen(1, Some(Arc::new(previous_parent))));
+
+        let mut fresh_parent = Scene::default();
+        fresh_parent.insert_primitive(offscreen(2, None));
+        let shared_parent = Arc::new(fresh_parent);
+        let mut next = Scene::default();
+        let mut resized_parent = offscreen(1, Some(shared_parent.clone()));
+        resized_parent.size.width = DevicePixels(200);
+        next.insert_primitive(resized_parent);
+        next.inherit_offscreen_scenes(&previous);
+
+        let parent = next.offscreen_surfaces[0].scene.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            parent.offscreen_surfaces[0].scene.as_ref().unwrap(),
+            &capture,
+        ));
+        assert!(shared_parent.offscreen_surfaces[0].scene.is_none());
+        let mut replayed = Scene::default();
+        replayed.replay(0..parent.len(), parent);
+        assert!(Arc::ptr_eq(
+            replayed.offscreen_surfaces[0].scene.as_ref().unwrap(),
+            &capture,
+        ));
     }
 
     fn quad() -> Quad {

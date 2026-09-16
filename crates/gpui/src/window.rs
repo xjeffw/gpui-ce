@@ -3076,6 +3076,14 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_without_scene(range.clone());
+        self.next_frame.scene.replay(
+            range.start.scene_index..range.end.scene_index,
+            &self.rendered_frame.scene,
+        );
+    }
+
+    pub(crate) fn reuse_paint_without_scene(&mut self, range: Range<PaintIndex>) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3107,10 +3115,6 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

@@ -1,7 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
+    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    OffscreenSurfaceId, PaintIndex, Pixels, PrepaintStateIndex, Render, Style, StyleRefinement,
+    TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -23,6 +24,7 @@ struct ViewCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    offscreen_surface: Option<OffscreenSurfaceId>,
 }
 
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
@@ -31,6 +33,7 @@ pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
     cached_style: Option<Rc<StyleRefinement>>,
+    offscreen_surface: Option<OffscreenSurfaceId>,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -39,6 +42,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
             cached_style: None,
+            offscreen_surface: None,
         }
     }
 }
@@ -49,6 +53,17 @@ impl AnyView {
     /// The one exception is when [Window::refresh] is called, in which case caching is ignored.
     pub fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style.into());
+        self.offscreen_surface = None;
+        self
+    }
+
+    /// Cache this view's layout and pixels in a viewport-sized GPU surface.
+    /// Unchanged frames composite the surface while retaining hitboxes and input
+    /// handlers. Invalidation follows [`Self::cached`]. The style must provide
+    /// the viewport size and the surface id must be unique within the window.
+    pub fn cached_offscreen(mut self, style: StyleRefinement, id: OffscreenSurfaceId) -> Self {
+        self.cached_style = Some(style.into());
+        self.offscreen_surface = Some(id);
         self
     }
 
@@ -69,6 +84,7 @@ impl AnyView {
                 entity,
                 render: self.render,
                 cached_style: self.cached_style,
+                offscreen_surface: self.offscreen_surface,
             }),
         }
     }
@@ -156,6 +172,7 @@ impl Element for AnyView {
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
+                        && element_state.cache_key.offscreen_surface == self.offscreen_surface
                         && !window.dirty_views.contains(&self.entity_id())
                         && !window.refreshing
                     {
@@ -191,6 +208,7 @@ impl Element for AnyView {
                                 bounds,
                                 content_mask,
                                 text_style,
+                                offscreen_surface: self.offscreen_surface,
                             },
                         },
                     )
@@ -203,7 +221,7 @@ impl Element for AnyView {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
         window: &mut Window,
@@ -221,8 +239,19 @@ impl Element for AnyView {
 
                         if let Some(element) = element {
                             let refreshing = mem::replace(&mut window.refreshing, true);
-                            element.paint(window, cx);
+                            if let Some(id) = self.offscreen_surface {
+                                window.paint_offscreen(id, bounds, true, |window| {
+                                    element.paint(window, cx);
+                                });
+                            } else {
+                                element.paint(window, cx);
+                            }
                             window.refreshing = refreshing;
+                        } else if let Some(id) = self.offscreen_surface {
+                            // Retain event handlers and element state without replaying the
+                            // captured drawing commands into either the frame or the texture.
+                            window.reuse_paint_without_scene(element_state.paint_range.clone());
+                            window.paint_offscreen(id, bounds, false, |_| {});
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
                         }
@@ -270,6 +299,7 @@ impl AnyWeakView {
             entity,
             render: self.render,
             cached_style: None,
+            offscreen_surface: None,
         })
     }
 }
@@ -316,5 +346,119 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AppContext, InteractiveElement, MouseButton, ParentElement, Styled, TestAppContext,
+        VisualTestContext, div, px, rgb,
+    };
+
+    struct SurfaceContent {
+        clicks: usize,
+    }
+
+    impl Render for SurfaceContent {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(rgb(0x123456))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        view.clicks += 1;
+                        cx.notify();
+                    }),
+                )
+                .child(format!("clicks: {}", self.clicks))
+        }
+    }
+
+    struct SurfaceRoot {
+        content: Entity<SurfaceContent>,
+        width: f32,
+    }
+
+    const SURFACE_ID: OffscreenSurfaceId = OffscreenSurfaceId(123);
+
+    impl Render for SurfaceRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).h(px(200.)).child(
+                AnyView::from(self.content.clone())
+                    .cached_offscreen(StyleRefinement::default().size_full(), SURFACE_ID),
+            )
+        }
+    }
+
+    fn redraw(cx: &mut VisualTestContext, update: impl FnOnce(&mut App)) -> bool {
+        cx.update(|window, cx| {
+            // Apply notifications inside the same App update as the explicit draw;
+            // otherwise App's effect flush may draw before we inspect the result.
+            update(cx);
+            let _ = window.draw(cx);
+            let scene = &window.rendered_frame.scene;
+            let surface = scene
+                .offscreen_surfaces
+                .iter()
+                .find(|s| s.id == SURFACE_ID)
+                .unwrap();
+            assert!(
+                scene.quads.is_empty(),
+                "content belongs in the texture, not the main scene"
+            );
+            surface.scene.is_some()
+        })
+    }
+
+    #[crate::test]
+    fn cached_offscreen_reuses_pixels_and_retains_input(cx: &mut TestAppContext) {
+        let (root, cx) = cx.add_window_view(|_, cx| SurfaceRoot {
+            content: cx.new(|_| SurfaceContent { clicks: 0 }),
+            width: 300.,
+        });
+        cx.run_until_parked();
+        for _ in 0..5 {
+            assert!(
+                !redraw(cx, |cx| root.update(cx, |_, cx| cx.notify())),
+                "unchanged frames only composite the texture"
+            );
+        }
+        let content = root.read_with(cx, |root, _| root.content.clone());
+        cx.simulate_mouse_down(
+            crate::point(px(20.), px(20.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        assert_eq!(content.read_with(cx, |content, _| content.clicks), 1);
+        assert!(
+            redraw(cx, |cx| content.update(cx, |content, cx| {
+                content.clicks += 1;
+                cx.notify();
+            })),
+            "descendant notifications repaint the surface"
+        );
+        assert!(!redraw(cx, |cx| root.update(cx, |_, cx| cx.notify())));
+        root.update(cx, |root, _| root.width = 400.);
+        assert!(
+            redraw(cx, |_| {}),
+            "resizing reallocates and repaints the surface"
+        );
+        assert!(!redraw(cx, |cx| root.update(cx, |_, cx| cx.notify())));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+            assert!(
+                window
+                    .rendered_frame
+                    .scene
+                    .offscreen_surfaces
+                    .iter()
+                    .any(|surface| surface.id == SURFACE_ID && surface.scene.is_some()),
+                "full refresh repaints the surface"
+            );
+        });
     }
 }

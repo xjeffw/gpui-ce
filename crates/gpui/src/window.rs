@@ -2640,6 +2640,15 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        if self.needs_present.get() {
+            // `rendered_frame` was drawn but never presented, so the offscreen scenes it
+            // captured never reached the renderer's cached textures. Surfaces this frame
+            // painted with `dirty = false` expect those textures to be current; carry the
+            // unpresented captures over so this frame renders them instead.
+            self.next_frame
+                .scene
+                .inherit_offscreen_scenes(&self.rendered_frame.scene);
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -2709,11 +2718,15 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    pub(crate) fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
-        self.needs_present.set(false);
+        // A renderer can decline a frame (swapchain out of date, acquire timed out, surface
+        // occluded) without reporting an error. Keep the frame pending so the next request
+        // presents it again and `draw` knows its offscreen captures are still undelivered.
+        self.needs_present
+            .set(!self.platform_window.last_frame_presented());
         profiling::finish_frame!();
     }
 

@@ -393,23 +393,39 @@ mod tests {
         }
     }
 
+    fn surface_captured(window: &Window) -> bool {
+        let scene = &window.rendered_frame.scene;
+        let surface = scene
+            .offscreen_surfaces
+            .iter()
+            .find(|s| s.id == SURFACE_ID)
+            .unwrap();
+        assert!(
+            scene.quads.is_empty(),
+            "content belongs in the texture, not the main scene"
+        );
+        surface.scene.is_some()
+    }
+
+    /// Presents whatever the window has drawn so far. Opening the window draws it without
+    /// presenting, and an unpresented capture is carried into the next draw rather than
+    /// reused from the texture.
+    fn present(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            window.present();
+        });
+    }
+
     fn redraw(cx: &mut VisualTestContext, update: impl FnOnce(&mut App)) -> bool {
         cx.update(|window, cx| {
             // Apply notifications inside the same App update as the explicit draw;
             // otherwise App's effect flush may draw before we inspect the result.
             update(cx);
             let _ = window.draw(cx);
-            let scene = &window.rendered_frame.scene;
-            let surface = scene
-                .offscreen_surfaces
-                .iter()
-                .find(|s| s.id == SURFACE_ID)
-                .unwrap();
-            assert!(
-                scene.quads.is_empty(),
-                "content belongs in the texture, not the main scene"
-            );
-            surface.scene.is_some()
+            let captured = surface_captured(window);
+            window.present();
+            captured
         })
     }
 
@@ -420,6 +436,7 @@ mod tests {
             width: 300.,
         });
         cx.run_until_parked();
+        present(cx);
         for _ in 0..5 {
             assert!(
                 !redraw(cx, |cx| root.update(cx, |_, cx| cx.notify())),
@@ -458,6 +475,41 @@ mod tests {
                     .iter()
                     .any(|surface| surface.id == SURFACE_ID && surface.scene.is_some()),
                 "full refresh repaints the surface"
+            );
+        });
+    }
+
+    #[crate::test]
+    fn unpresented_offscreen_capture_carries_into_the_next_draw(cx: &mut TestAppContext) {
+        let (root, cx) = cx.add_window_view(|_, cx| SurfaceRoot {
+            content: cx.new(|_| SurfaceContent { clicks: 0 }),
+            width: 300.,
+        });
+        cx.run_until_parked();
+        present(cx);
+        let content = root.read_with(cx, |root, _| root.content.clone());
+        cx.update(|window, cx| {
+            // A content change captures the surface, but the frame holding that capture is
+            // replaced before it is presented, the way `dispatch_key_event` redraws a dirty
+            // window ahead of a key event.
+            content.update(cx, |content, cx| {
+                content.clicks += 1;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+            assert!(surface_captured(window));
+            root.update(cx, |_, cx| cx.notify());
+            let _ = window.draw(cx);
+            assert!(
+                surface_captured(window),
+                "a draw replacing an unpresented frame must carry its offscreen capture"
+            );
+            window.present();
+            root.update(cx, |_, cx| cx.notify());
+            let _ = window.draw(cx);
+            assert!(
+                !surface_captured(window),
+                "once presented, unchanged frames composite the texture again"
             );
         });
     }

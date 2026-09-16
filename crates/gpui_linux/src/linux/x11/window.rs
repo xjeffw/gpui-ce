@@ -279,6 +279,7 @@ pub struct X11WindowState {
     active: bool,
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
+    renderer_presented: bool,
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
@@ -797,6 +798,7 @@ impl X11WindowState {
                 active: false,
                 hovered: false,
                 force_render_after_recovery: false,
+                renderer_presented: false,
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
@@ -1692,14 +1694,19 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
+            inner.renderer_presented = false;
             return;
         }
 
-        inner.renderer.draw(scene);
+        inner.renderer_presented = inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
+    }
+
+    fn last_frame_presented(&self) -> bool {
+        self.0.state.borrow().renderer_presented
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

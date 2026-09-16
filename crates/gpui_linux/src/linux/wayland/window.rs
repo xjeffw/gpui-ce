@@ -1430,6 +1430,10 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn last_frame_presented(&self) -> bool {
+        self.borrow().renderer_presented
+    }
+
     fn completed_frame(&self) {
         let mut state = self.borrow_mut();
 

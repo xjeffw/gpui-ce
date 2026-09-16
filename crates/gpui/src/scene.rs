@@ -213,6 +213,39 @@ impl Scene {
         self.offscreen_surfaces.sort_by_key(|surface| surface.order);
     }
 
+    /// Carries captured offscreen scenes forward from a frame that was never presented.
+    ///
+    /// [`Window::paint_offscreen`] captures a surface's scene only when its caller reports the
+    /// surface dirty; callers then treat that capture as painted and give later frames
+    /// `scene: None` so the renderer composites its cached texture. If the frame holding the
+    /// capture is replaced before the renderer sees it (a draw that refreshes the dispatch
+    /// tree ahead of a key event, or a frame the renderer declined), that texture was never
+    /// updated. Filling this frame's `None` entries from the unpresented frame keeps the
+    /// capture alive until a frame actually presents it.
+    pub(crate) fn inherit_offscreen_scenes(&mut self, unpresented: &Scene) {
+        for surface in &mut self.offscreen_surfaces {
+            let Some(previous) = unpresented
+                .offscreen_surfaces
+                .iter()
+                .find(|previous| previous.id == surface.id && previous.size == surface.size)
+            else {
+                continue;
+            };
+            match (&mut surface.scene, &previous.scene) {
+                (None, Some(scene)) => surface.scene = Some(Arc::clone(scene)),
+                (Some(scene), Some(previous_scene)) => {
+                    // A fresh capture can itself hold surfaces painted with `dirty = false`.
+                    // A capture replayed from the unpresented frame shares its `Arc` and
+                    // already carries everything it needs.
+                    if let Some(scene) = Arc::get_mut(scene) {
+                        scene.inherit_offscreen_scenes(previous_scene);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn translate(&mut self, delta: Point<ScaledPixels>) {
         for operation in &mut self.paint_operations {
             match operation {

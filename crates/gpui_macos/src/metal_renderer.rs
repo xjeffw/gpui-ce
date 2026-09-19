@@ -2045,8 +2045,20 @@ impl MetalRenderer {
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         for surface in surfaces {
+            // A surface painted with `dirty = false` reuses a texture from an earlier frame, but
+            // drawn frames free the textures of surfaces they omit. Leave a missing one out until
+            // it is painted again; returning false would report "scene too large", grow the
+            // instance buffer to its limit, and drop every frame instead.
             let Some(target) = self.offscreen_surfaces.get(&surface.id) else {
-                return false;
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!(
+                        "offscreen surface {} has no cached texture; skipping it until it is painted",
+                        surface.id.0
+                    );
+                }
+                continue;
             };
             let sprite = Self::offscreen_surface_sprite(surface, target.size);
             if !self.draw_polychrome_sprites_with_texture(

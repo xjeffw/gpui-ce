@@ -1988,9 +1988,19 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         for surface in surfaces {
+            // A surface painted with `dirty = false` reuses a texture from an earlier frame, but
+            // drawn frames free the textures of surfaces they omit. Leave a missing one out of
+            // this frame and let `needs_redraw` force a render that recaptures every surface.
+            // Returning false here would read as an instance-buffer overflow: the buffer would
+            // grow to its limit and the frame would be declined, and some compositors send no
+            // frame callback after a declined frame, so the window would stop repainting.
             let Some(target) = self.resources().offscreen_surfaces.get(&surface.id) else {
+                log::warn!(
+                    "offscreen surface {} has no cached texture; repainting it next frame",
+                    surface.id.0
+                );
                 self.needs_redraw = true;
-                return false;
+                continue;
             };
             let sprite = Self::offscreen_surface_sprite(surface, target.size);
             let data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };

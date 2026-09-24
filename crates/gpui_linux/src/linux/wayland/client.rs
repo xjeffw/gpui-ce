@@ -315,6 +315,20 @@ impl WaylandClientStatePtr {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
     }
 
+    /// The latest input serial and the surface with keyboard focus, which together let a
+    /// compositor grant an activation token.
+    pub fn activation_token_source(&self) -> (u32, Option<wl_surface::WlSurface>) {
+        let client = self.0.upgrade().unwrap();
+        let state = client.borrow();
+        (
+            state.serial_tracker.get_latest(),
+            state
+                .keyboard_focused_window
+                .as_ref()
+                .map(|window| window.surface()),
+        )
+    }
+
     pub fn set_pending_activation(&self, window: ObjectId) {
         self.0.upgrade().unwrap().borrow_mut().pending_activation =
             Some(PendingActivation::Window(window));

@@ -1265,18 +1265,21 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn activate(&self) {
-        // Try to request an activation token. Even though the activation is likely going to be rejected,
-        // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
+        // Request an activation token. Compositors grant a usable one only for a serial of input
+        // the app received, asked for by the surface that has keyboard focus (wlroots rejects
+        // any other request), so ask on behalf of the app's focused window: usually the one
+        // whose key or click led to this activation. Without a focused window the activation
+        // is likely rejected, but KWin and Mutter can still use the app_id to show that the
+        // window requests attention.
         let state = self.borrow();
         if let (Some(activation), Some(app_id)) = (&state.globals.activation, state.app_id.clone())
         {
             state.client.set_pending_activation(state.surface.id());
+            let (serial, focused_surface) = state.client.activation_token_source();
             let token = activation.get_activation_token(&state.globals.qh, ());
-            // The serial isn't exactly important here, since the activation is probably going to be rejected anyway.
-            let serial = state.client.get_serial(SerialKind::MousePress);
             token.set_app_id(app_id);
             token.set_serial(serial, &state.globals.seat);
-            token.set_surface(&state.surface);
+            token.set_surface(focused_surface.as_ref().unwrap_or(&state.surface));
             token.commit();
         }
     }

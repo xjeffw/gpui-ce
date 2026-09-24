@@ -8,7 +8,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    StyleRefinement, Styled, TextStyle, Window, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -49,6 +49,7 @@ where
             ..Interactivity::new()
         },
         scroll_handle: None,
+        measurement_key: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
     }
@@ -64,6 +65,7 @@ pub struct UniformList {
     decorations: Vec<Box<dyn UniformListDecoration>>,
     interactivity: Interactivity,
     scroll_handle: Option<UniformListScrollHandle>,
+    measurement_key: Option<u64>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
 }
@@ -72,6 +74,7 @@ pub struct UniformList {
 pub struct UniformListFrameState {
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
+    measured_item_size: Size<Pixels>,
 }
 
 /// A handle for controlling the scroll position of a uniform list.
@@ -119,6 +122,20 @@ pub struct UniformListScrollState {
     pub last_item_size: Option<ItemSize>,
     /// Whether the list was vertically flipped during last layout.
     pub y_flipped: bool,
+    measurement: Option<CachedItemMeasurement>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedItemMeasurement {
+    key: u64,
+    item_count: usize,
+    item_index: usize,
+    list_width: Option<Pixels>,
+    text_style: TextStyle,
+    rem_size: Pixels,
+    scale_factor: f32,
+    viewport_size: Size<Pixels>,
+    size: Size<Pixels>,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -139,7 +156,13 @@ impl UniformListScrollHandle {
             deferred_scroll_to_item: None,
             last_item_size: None,
             y_flipped: false,
+            measurement: None,
         })))
+    }
+
+    /// Drop a cached item measurement after changing the items or their layout.
+    pub fn invalidate_measurement(&self) {
+        self.0.borrow_mut().measurement = None;
     }
 
     /// Scroll the list so that the given item index is visible.
@@ -324,6 +347,7 @@ impl Element for UniformList {
             UniformListFrameState {
                 items: SmallVec::new(),
                 decorations: SmallVec::new(),
+                measured_item_size: item_size,
             },
         )
     }
@@ -356,7 +380,7 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = self.measure_item(None, window, cx);
+        let longest_item_size = frame_state.measured_item_size;
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -624,6 +648,15 @@ impl UniformList {
         self
     }
 
+    /// Reuse the measured item size while the list content has the same key.
+    /// Change the key whenever item content or its layout can change. The inherited
+    /// text style, window size, scale, and rem size are checked automatically.
+    /// Requires a scroll handle so the measurement survives between frames.
+    pub fn with_measurement_key(mut self, key: u64) -> Self {
+        self.measurement_key = Some(key);
+        self
+    }
+
     /// Sets the sizing behavior, similar to the `List` element.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
@@ -666,6 +699,20 @@ impl UniformList {
         }
 
         let item_ix = cmp::min(self.item_to_measure_index, self.item_count - 1);
+        let measurement = self.measurement_key.zip(self.scroll_handle.as_ref());
+        if let Some((key, handle)) = measurement
+            && let Some(cached) = &handle.0.borrow().measurement
+            && cached.key == key
+            && cached.item_count == self.item_count
+            && cached.item_index == item_ix
+            && cached.list_width == list_width
+            && cached.text_style == window.text_style()
+            && cached.rem_size == window.rem_size()
+            && cached.scale_factor == window.scale_factor()
+            && cached.viewport_size == window.viewport_size()
+        {
+            return cached.size;
+        }
         let mut items = (self.render_items)(item_ix..item_ix + 1, window, cx);
         let Some(mut item_to_measure) = items.pop() else {
             return Size::default();
@@ -676,7 +723,21 @@ impl UniformList {
             }),
             AvailableSpace::MinContent,
         );
-        item_to_measure.layout_as_root(available_space, window, cx)
+        let size = item_to_measure.layout_as_root(available_space, window, cx);
+        if let Some((key, handle)) = measurement {
+            handle.0.borrow_mut().measurement = Some(CachedItemMeasurement {
+                key,
+                item_count: self.item_count,
+                item_index: item_ix,
+                list_width,
+                text_style: window.text_style().clone(),
+                rem_size: window.rem_size(),
+                scale_factor: window.scale_factor(),
+                viewport_size: window.viewport_size(),
+                size,
+            });
+        }
+        size
     }
 
     /// Track and render scroll state of this list with reference to the given scroll handle.
@@ -720,6 +781,64 @@ impl InteractiveElement for UniformList {
 #[cfg(test)]
 mod test {
     use crate::TestAppContext;
+
+    #[gpui::test]
+    fn keyed_measurement_reuses_layout_until_key_changes(cx: &mut TestAppContext) {
+        use crate::{
+            Context, Render, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct TestView {
+            scroll_handle: UniformListScrollHandle,
+            measurement_key: u64,
+            render_calls: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let calls = self.render_calls.clone();
+                div().size_full().child(
+                    uniform_list("entries", 1, move |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        vec![div().h(px(20.0)).child("item")]
+                    })
+                    .track_scroll(&self.scroll_handle)
+                    .with_measurement_key(self.measurement_key)
+                    .h(px(100.0)),
+                )
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view(|_, _| TestView {
+            scroll_handle: UniformListScrollHandle::new(),
+            measurement_key: 1,
+            render_calls: calls.clone(),
+        });
+        cx.run_until_parked();
+
+        let before = calls.get();
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear();
+        });
+        assert_eq!(calls.get() - before, 1, "only the visible row is rendered");
+
+        let before = calls.get();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.measurement_key = 2;
+                cx.notify();
+            });
+            window.draw(cx).clear();
+        });
+        assert_eq!(
+            calls.get() - before,
+            2,
+            "the new key measures the row again"
+        );
+    }
 
     #[gpui::test]
     fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {

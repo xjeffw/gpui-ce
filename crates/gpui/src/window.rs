@@ -3948,32 +3948,9 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-            subpixel_rendering,
-            dilation,
-        };
+        let (integer_origin, params) =
+            self.glyph_render_params(origin, font_id, glyph_id, font_size, color);
+        let subpixel_rendering = params.subpixel_rendering;
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
@@ -4013,6 +3990,66 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// Returns the device pixels that [`Window::paint_glyph`] covers when it paints a monochrome
+    /// glyph at `origin` in `color`: the bounds of the rasterized glyph, which hinting and
+    /// subpixel positioning make differ from its outline, in the window's device pixels.
+    ///
+    /// An element can use them to place a glyph's ink exactly on the device pixel grid, such as
+    /// to center a character in a box. Unlike painting, this may be called in any phase.
+    pub fn glyph_raster_bounds(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<Bounds<DevicePixels>> {
+        let (integer_origin, params) =
+            self.glyph_render_params(origin, font_id, glyph_id, font_size, color);
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        Ok(Bounds {
+            origin: integer_origin.map(|c| DevicePixels(c.0 as i32)) + raster_bounds.origin,
+            size: raster_bounds.size,
+        })
+    }
+
+    /// The whole device pixel at which a monochrome glyph painted at `origin` is placed, and the
+    /// parameters it is rasterized with.
+    fn glyph_render_params(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> (Point<ScaledPixels>, RenderGlyphParams) {
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: self.should_use_subpixel_rendering(font_id, font_size),
+            dilation: self.text_system().glyph_dilation_for_color(color),
+        };
+        (integer_origin, params)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {

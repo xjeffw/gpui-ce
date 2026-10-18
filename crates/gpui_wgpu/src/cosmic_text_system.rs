@@ -376,9 +376,11 @@ impl CosmicTextSystemState {
         let font_ref = loaded_font.font.as_swash();
         let pixel_size = f32::from(params.font_size);
 
+        // The variant is a fraction of a device pixel, and the scaler below scales the outline
+        // to device pixels before the offset is added, so the offset is not scaled again.
         let subpixel_offset = Vector::new(
-            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32 / params.scale_factor,
-            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
+            params.subpixel_variant.x as f32 / SUBPIXEL_VARIANTS_X as f32,
+            params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32,
         );
 
         let mut scaler = self

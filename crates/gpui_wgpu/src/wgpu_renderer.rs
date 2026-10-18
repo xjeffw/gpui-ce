@@ -295,6 +295,36 @@ struct TextureBindGroup {
     frame_number: u64,
 }
 
+/// A render pass that scene batches draw into, with the pipeline and group 0 it has bound, so
+/// that consecutive draws bind them once: wgpu tracks and rebinds every bind call.
+struct ScenePass<'encoder> {
+    pass: wgpu::RenderPass<'encoder>,
+    pipeline: Option<wgpu::RenderPipeline>,
+    globals: Option<wgpu::BindGroup>,
+}
+
+impl<'encoder> ScenePass<'encoder> {
+    fn new(pass: wgpu::RenderPass<'encoder>) -> Self {
+        Self {
+            pass,
+            pipeline: None,
+            globals: None,
+        }
+    }
+
+    /// Sets `pipeline`, and `globals` as bind group 0, unless they are bound already.
+    fn bind(&mut self, pipeline: &wgpu::RenderPipeline, globals: &wgpu::BindGroup) {
+        if self.pipeline.as_ref() != Some(pipeline) {
+            self.pass.set_pipeline(pipeline);
+            self.pipeline = Some(pipeline.clone());
+        }
+        if self.globals.as_ref() != Some(globals) {
+            self.pass.set_bind_group(0, globals, &[]);
+            self.globals = Some(globals.clone());
+        }
+    }
+}
+
 struct OffscreenRenderTarget {
     #[allow(dead_code)]
     texture: Arc<wgpu::Texture>,
@@ -1730,20 +1760,21 @@ impl WgpuRenderer {
             let mut filter_stack: Vec<(FilterBoundary, Arc<wgpu::TextureView>, bool)> = Vec::new();
 
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: current_target.as_ref(),
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
+                let mut pass =
+                    ScenePass::new(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(label),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: current_target.as_ref(),
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    }));
 
                 for batch in scene.batches() {
                     let ok = match batch {
@@ -1769,20 +1800,22 @@ impl WgpuRenderer {
                                 &mut instances,
                             );
 
-                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some(label),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: current_target.as_ref(),
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                ..Default::default()
-                            });
+                            pass = ScenePass::new(encoder.begin_render_pass(
+                                &wgpu::RenderPassDescriptor {
+                                    label: Some(label),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: current_target.as_ref(),
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                },
+                            ));
 
                             if did_draw {
                                 self.draw_paths_from_intermediate(
@@ -1831,20 +1864,22 @@ impl WgpuRenderer {
                             for filter in &scene.backdrop_filters[range] {
                                 self.draw_backdrop_filter(&mut encoder, filter, &current_target);
                             }
-                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some(label),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: current_target.as_ref(),
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                ..Default::default()
-                            });
+                            pass = ScenePass::new(encoder.begin_render_pass(
+                                &wgpu::RenderPassDescriptor {
+                                    label: Some(label),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: current_target.as_ref(),
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                },
+                            ));
                             true
                         }
                         PrimitiveBatch::FilterBoundary(ix) => {
@@ -1860,24 +1895,26 @@ impl WgpuRenderer {
                                     let parent = current_target.clone();
                                     current_target = group_views[depth].clone();
                                     filter_stack.push((boundary, parent, true));
-                                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some("filter_group"),
-                                        color_attachments: &[Some(
-                                            wgpu::RenderPassColorAttachment {
-                                                view: current_target.as_ref(),
-                                                resolve_target: None,
-                                                ops: wgpu::Operations {
-                                                    load: wgpu::LoadOp::Clear(
-                                                        wgpu::Color::TRANSPARENT,
-                                                    ),
-                                                    store: wgpu::StoreOp::Store,
+                                    pass = ScenePass::new(encoder.begin_render_pass(
+                                        &wgpu::RenderPassDescriptor {
+                                            label: Some("filter_group"),
+                                            color_attachments: &[Some(
+                                                wgpu::RenderPassColorAttachment {
+                                                    view: current_target.as_ref(),
+                                                    resolve_target: None,
+                                                    ops: wgpu::Operations {
+                                                        load: wgpu::LoadOp::Clear(
+                                                            wgpu::Color::TRANSPARENT,
+                                                        ),
+                                                        store: wgpu::StoreOp::Store,
+                                                    },
+                                                    depth_slice: None,
                                                 },
-                                                depth_slice: None,
-                                            },
-                                        )],
-                                        depth_stencil_attachment: None,
-                                        ..Default::default()
-                                    });
+                                            )],
+                                            depth_stencil_attachment: None,
+                                            ..Default::default()
+                                        },
+                                    ));
                                 } else {
                                     filter_stack.push((boundary, current_target.clone(), false));
                                 }
@@ -1901,22 +1938,24 @@ impl WgpuRenderer {
                                         false,
                                     );
                                     current_target = parent;
-                                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some(label),
-                                        color_attachments: &[Some(
-                                            wgpu::RenderPassColorAttachment {
-                                                view: current_target.as_ref(),
-                                                resolve_target: None,
-                                                ops: wgpu::Operations {
-                                                    load: wgpu::LoadOp::Load,
-                                                    store: wgpu::StoreOp::Store,
+                                    pass = ScenePass::new(encoder.begin_render_pass(
+                                        &wgpu::RenderPassDescriptor {
+                                            label: Some(label),
+                                            color_attachments: &[Some(
+                                                wgpu::RenderPassColorAttachment {
+                                                    view: current_target.as_ref(),
+                                                    resolve_target: None,
+                                                    ops: wgpu::Operations {
+                                                        load: wgpu::LoadOp::Load,
+                                                        store: wgpu::StoreOp::Store,
+                                                    },
+                                                    depth_slice: None,
                                                 },
-                                                depth_slice: None,
-                                            },
-                                        )],
-                                        depth_stencil_attachment: None,
-                                        ..Default::default()
-                                    });
+                                            )],
+                                            depth_stencil_attachment: None,
+                                            ..Default::default()
+                                        },
+                                    ));
                                 }
                             }
                             true
@@ -2096,7 +2135,7 @@ impl WgpuRenderer {
         &mut self,
         surfaces: &[OffscreenSurface],
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         for surface in surfaces {
             // A surface painted with `dirty = false` reuses a texture from an earlier frame, but
@@ -2160,7 +2199,7 @@ impl WgpuRenderer {
         &self,
         quads: &[Quad],
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let data = unsafe { Self::instance_bytes(quads) };
         self.draw_instances(
@@ -2176,7 +2215,7 @@ impl WgpuRenderer {
         &self,
         shadows: &[Shadow],
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let data = unsafe { Self::instance_bytes(shadows) };
         self.draw_instances(
@@ -2192,7 +2231,7 @@ impl WgpuRenderer {
         &self,
         underlines: &[Underline],
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let data = unsafe { Self::instance_bytes(underlines) };
         self.draw_instances(
@@ -2209,7 +2248,7 @@ impl WgpuRenderer {
         sprites: &[MonochromeSprite],
         texture_id: AtlasTextureId,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
@@ -2228,7 +2267,7 @@ impl WgpuRenderer {
         sprites: &[SubpixelSprite],
         texture_id: AtlasTextureId,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
@@ -2249,7 +2288,7 @@ impl WgpuRenderer {
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) -> bool {
+    fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut ScenePass<'_>) -> bool {
         let resources = self.resources();
         for surface in surfaces {
             let Some(wgpu_texture) = surface.texture.downcast_ref::<wgpu::Texture>() else {
@@ -2290,16 +2329,15 @@ impl WgpuRenderer {
                     ],
                 });
 
-            pass.set_pipeline(&resources.pipelines.surfaces);
-            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &bind_group, &[]);
-            pass.draw(0..4, 0..1);
+            pass.bind(&resources.pipelines.surfaces, &resources.globals_bind_group);
+            pass.pass.set_bind_group(1, &bind_group, &[]);
+            pass.pass.draw(0..4, 0..1);
         }
         true
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    fn draw_surfaces(&self, _surfaces: &[PaintSurface], _pass: &mut wgpu::RenderPass<'_>) -> bool {
+    fn draw_surfaces(&self, _surfaces: &[PaintSurface], _pass: &mut ScenePass<'_>) -> bool {
         true
     }
 
@@ -2594,7 +2632,7 @@ impl WgpuRenderer {
         sprites: &[PolychromeSprite],
         texture_id: AtlasTextureId,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
@@ -2614,7 +2652,7 @@ impl WgpuRenderer {
         instance_count: u32,
         pipeline: &wgpu::RenderPipeline,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         if instance_count == 0 {
             return true;
@@ -2622,10 +2660,9 @@ impl WgpuRenderer {
         let Some((offset, size)) = self.write_to_instance_buffer(instances, data) else {
             return false;
         };
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
-        self.set_instances_bind_group(pass, offset, size, None);
-        pass.draw(0..4, 0..instance_count);
+        pass.bind(pipeline, &self.resources().globals_bind_group);
+        self.set_instances_bind_group(&mut pass.pass, offset, size, None);
+        pass.pass.draw(0..4, 0..instance_count);
         true
     }
 
@@ -2636,7 +2673,7 @@ impl WgpuRenderer {
         texture_view: &wgpu::TextureView,
         pipeline: &wgpu::RenderPipeline,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         if instance_count == 0 {
             return true;
@@ -2644,10 +2681,9 @@ impl WgpuRenderer {
         let Some((offset, size)) = self.write_to_instance_buffer(instances, data) else {
             return false;
         };
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
-        self.set_instances_bind_group(pass, offset, size, Some(texture_view));
-        pass.draw(0..4, 0..instance_count);
+        pass.bind(pipeline, &self.resources().globals_bind_group);
+        self.set_instances_bind_group(&mut pass.pass, offset, size, Some(texture_view));
+        pass.pass.draw(0..4, 0..instance_count);
         true
     }
 
@@ -2713,7 +2749,7 @@ impl WgpuRenderer {
         paths: &[Path<ScaledPixels>],
         path_intermediate_view: &wgpu::TextureView,
         instances: &mut Vec<u8>,
-        pass: &mut wgpu::RenderPass<'_>,
+        pass: &mut ScenePass<'_>,
     ) -> bool {
         let first_path = &paths[0];
         let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)

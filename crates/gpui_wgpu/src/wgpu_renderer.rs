@@ -147,6 +147,12 @@ struct WgpuPipelines {
     blur: wgpu::RenderPipeline,
     /// Composites a blurred texture into a rounded rectangle (with clip + opacity).
     blur_composite: wgpu::RenderPipeline,
+    /// Fades the target under a backdrop by the weight that `blur_backdrop_composite` then adds
+    /// the blurred backdrop with, so that the blur replaces the backdrop.
+    blur_backdrop_erase: wgpu::RenderPipeline,
+    /// [`Self::blur_composite`] for a backdrop, added to the target that
+    /// [`Self::blur_backdrop_erase`] faded.
+    blur_backdrop_composite: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -1271,6 +1277,58 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // A backdrop is part of the scene that its blur replaces. Blended over it, the blur
+        // would stack on a translucent backdrop, as in a transparent window, and turn it more
+        // opaque, so a backdrop's composite mixes the two instead: the erase pass scales the
+        // target by one minus the weight it outputs as alpha, and the composite pass adds the
+        // blur, which it scales by the same weight.
+        let erase_component = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let blur_backdrop_erase = create_pipeline(
+            "blur_backdrop_erase",
+            "vs_blur_composite",
+            "fs_blur_backdrop_erase",
+            &layouts.globals,
+            &layouts.blur,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState {
+                    color: erase_component,
+                    alpha: erase_component,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+        let add_component = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let blur_backdrop_composite = create_pipeline(
+            "blur_backdrop_composite",
+            "vs_blur_composite",
+            "fs_blur_composite",
+            &layouts.globals,
+            &layouts.blur,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState {
+                    color: add_component,
+                    alpha: add_component,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         WgpuPipelines {
             quads,
             shadows,
@@ -1285,6 +1343,8 @@ impl WgpuRenderer {
             blur_downsample,
             blur,
             blur_composite,
+            blur_backdrop_erase,
+            blur_backdrop_composite,
         }
     }
 
@@ -2567,10 +2627,21 @@ impl WgpuRenderer {
             depth_stencil_attachment: None,
             ..Default::default()
         });
-        pass.set_pipeline(&resources.pipelines.blur_composite);
-        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &bind_group, &[]);
-        pass.draw(0..4, 0..1);
+        // A backdrop replaces what it blurs: fade it, then add the blur.
+        let pipelines: &[&wgpu::RenderPipeline] = if clip_rounded {
+            &[
+                &resources.pipelines.blur_backdrop_erase,
+                &resources.pipelines.blur_backdrop_composite,
+            ]
+        } else {
+            &[&resources.pipelines.blur_composite]
+        };
+        for pipeline in pipelines {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
     }
 
     /// Blur the scene painted so far behind `filter.bounds` and composite it back as frosted glass.

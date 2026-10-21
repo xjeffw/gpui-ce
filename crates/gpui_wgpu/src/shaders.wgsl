@@ -1373,7 +1373,9 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 //      (also reused to blit the offscreen scene into the swapchain).
 //   2. `fs_blur` runs one axis of a separable gaussian; the host invokes it twice.
 //   3. `fs_blur_composite` samples the blurred texture and composites it into a rounded
-//      rectangle, clipped and modulated by opacity.
+//      rectangle, clipped and modulated by opacity. A backdrop first erases what it covers
+//      with `fs_blur_backdrop_erase`, so that the blur replaces the backdrop rather than
+//      stacking on it.
 //
 // Notes (review #5, #7): the scene/blur textures use the swapchain's (typically non-sRGB)
 // format, so the gaussian runs on gamma-encoded values rather than linear light — consistent
@@ -1465,19 +1467,12 @@ fn vs_blur_composite(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
     return out;
 }
 
-@fragment
-fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
+// How much of the composite a fragment takes: the opacity, times the coverage of the rounded
+// rect for a backdrop, and 0.0 outside the content mask.
+fn blur_composite_weight(input: BlurVarying) -> f32 {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return 0.0;
     }
-
-    // Sample the half-res blur by screen position, using the SAME fixed 2:1 grid the snapped
-    // downsample wrote (anchored at the origin, independent of viewport parity). `2*floor(W/2)` is
-    // the source span the half-res texture covers; dividing by it maps screen pixel p to half-res
-    // texel p/2 at every window size, so the composite stays put rather than wobbling on resize.
-    let blur_span = 2.0 * floor(globals.viewport_size * 0.5);
-    let uv = input.position.xy / blur_span;
-    let blurred = textureSampleLevel(t_blur, s_blur, uv, 0.0);
 
     let corner_radii = Corners(
         blur_locals.corner_radii.x,
@@ -1490,11 +1485,34 @@ fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
     // isn't sharply truncated at the edge; its shape comes from the blurred group's own alpha.
     let distance = quad_sdf(input.position.xy, blur_locals.bounds, corner_radii);
     let coverage = select(1.0, saturate(0.5 - distance), blur_locals.clip_rounded > 0.5);
+    return coverage * blur_locals.opacity;
+}
+
+@fragment
+fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
+    let c = blur_composite_weight(input);
+
+    // Sample the half-res blur by screen position, using the SAME fixed 2:1 grid the snapped
+    // downsample wrote (anchored at the origin, independent of viewport parity). `2*floor(W/2)` is
+    // the source span the half-res texture covers; dividing by it maps screen pixel p to half-res
+    // texel p/2 at every window size, so the composite stays put rather than wobbling on resize.
+    let blur_span = 2.0 * floor(globals.viewport_size * 0.5);
+    let uv = input.position.xy / blur_span;
+    let blurred = textureSampleLevel(t_blur, s_blur, uv, 0.0);
 
     // The blurred sample is premultiplied (blurring against the transparent, rgb=0 surround scales
-    // rgb with the fading alpha), so output premultiplied and let the pipeline blend premultiplied.
-    // A backdrop's scene is opaque (alpha ~= 1) so this replaces; a content-filter group is
-    // transparent outside its subtree, so the target shows through there instead of darkening.
-    let c = coverage * blur_locals.opacity;
+    // rgb with the fading alpha), so output premultiplied. A content-filter group is transparent
+    // outside its subtree, and its pipeline blends it over the target, which shows through there
+    // instead of darkening. A backdrop's pipeline adds it to the target that
+    // `fs_blur_backdrop_erase` faded by the same weight.
     return vec4<f32>(blurred.rgb * c, blurred.a * c);
+}
+
+// The first half of a backdrop's composite: fades the target by the weight of the blurred
+// backdrop, which `fs_blur_composite` then adds, so that the result is the mix of the two. Blending
+// the blur over the backdrop instead would stack the two where the backdrop is translucent, as in
+// a transparent window, and make it more opaque than it is.
+@fragment
+fn fs_blur_backdrop_erase(input: BlurVarying) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, blur_composite_weight(input));
 }

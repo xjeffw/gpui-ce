@@ -181,6 +181,35 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// The offscreen surface that is all the scene holds, if it holds one and nothing else.
+    pub(crate) fn sole_offscreen_surface(&self) -> Option<&OffscreenSurface> {
+        (self.paint_operations.len() == 1 && self.offscreen_surfaces.len() == 1)
+            .then(|| &self.offscreen_surfaces[0])
+    }
+
+    /// Replaces the offscreen surface at `index` with `surface`, which takes the draw order of the
+    /// one it replaces, in the scene's paint operations as well.
+    pub(crate) fn replace_offscreen_surface(&mut self, index: usize, surface: OffscreenSurface) {
+        let Some(current) = self.offscreen_surfaces.get_mut(index) else {
+            return;
+        };
+        let replaced = OffscreenSurface {
+            order: current.order,
+            ..surface
+        };
+        let (current_id, current_size) = (current.id, current.size);
+        *current = replaced.clone();
+        if let Some(operation) = self.paint_operations.iter_mut().rev().find(|operation| {
+            matches!(
+                operation,
+                PaintOperation::Primitive(Primitive::OffscreenSurface(previous))
+                    if previous.id == current_id && previous.size == current_size
+            )
+        }) {
+            *operation = PaintOperation::Primitive(Primitive::OffscreenSurface(replaced));
+        }
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -1098,6 +1127,14 @@ impl From<PaintSurface> for Primitive {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[expect(missing_docs)]
 pub struct OffscreenSurfaceId(pub u64);
+
+impl OffscreenSurfaceId {
+    /// The id of the surface that holds the backgrounds of the surface with this id while it is
+    /// painted in a background layer (`Window::with_background_layer`).
+    pub fn background_layer(self) -> Self {
+        Self(self.0.rotate_left(29) ^ 0x6a09_e667_f3bc_c909)
+    }
+}
 
 #[derive(Clone)]
 #[expect(missing_docs)]

@@ -957,6 +957,52 @@ enum InputModality {
     Keyboard,
 }
 
+/// A background layer of the frame being painted, which `Window::with_background_layer` adds to.
+struct PendingBackgroundLayer {
+    /// The index of its offscreen surface in the scene's.
+    index: usize,
+    /// The backgrounds painted into it, in window coordinates.
+    scene: Scene,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    size: Size<DevicePixels>,
+    opacity: f32,
+}
+
+impl PendingBackgroundLayer {
+    /// The offscreen surface that composites the layer. A layer that holds the surface of one
+    /// offscreen surface's backgrounds, and nothing else, is that surface faded, with no texture
+    /// of its own to render.
+    fn composite(&self, id: OffscreenSurfaceId) -> OffscreenSurface {
+        if let Some(surface) = self.scene.sole_offscreen_surface() {
+            return OffscreenSurface {
+                opacity: surface.opacity * self.opacity,
+                ..surface.clone()
+            };
+        }
+        let empty = self.scene.len() == 0;
+        let mut scene = self.scene.clone();
+        scene.translate(point(
+            ScaledPixels(-self.bounds.origin.x.0),
+            ScaledPixels(-self.bounds.origin.y.0),
+        ));
+        scene.finish();
+        OffscreenSurface {
+            order: 0,
+            id,
+            bounds: self.bounds,
+            content_mask: self.content_mask,
+            size: if empty {
+                size(DevicePixels(1), DevicePixels(1))
+            } else {
+                self.size
+            },
+            opacity: if empty { 0.0 } else { self.opacity },
+            scene: Some(Arc::new(scene)),
+        }
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -981,6 +1027,14 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// Where the fills of the quads painted go, instead of the scene, while a background layer
+    /// is painted (`with_background_layer`).
+    background_layer: Option<Scene>,
+    /// The background layers of the frame being painted, by id and by the depth of the offscreen
+    /// surfaces they were started in.
+    background_layers: FxHashMap<(OffscreenSurfaceId, usize), PendingBackgroundLayer>,
+    /// How many offscreen surfaces are being painted, one inside the other.
+    offscreen_depth: usize,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1681,6 +1735,9 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            background_layer: None,
+            background_layers: FxHashMap::default(),
+            offscreen_depth: 0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2342,6 +2399,15 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Sets the parts of the window that the compositor blurs while its background appearance is
+    /// [`WindowBackgroundAppearance::Blurred`], in window coordinates: all of it with `None`, the
+    /// default, and nothing with an empty list. Wayland compositors that support
+    /// `ext-background-effect-v1` or KDE's blur protocol blur the region; elsewhere the whole
+    /// window is blurred.
+    pub fn set_background_blur_region(&self, region: Option<Vec<Bounds<Pixels>>>) {
+        self.platform_window.set_background_blur_region(region);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -2655,6 +2721,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.background_layers.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 
@@ -3354,6 +3421,80 @@ impl Window {
         self.element_opacity
     }
 
+    /// Paints what `f` paints with its backgrounds, the fills of its quads, at `opacity`, while
+    /// its borders, text, paths and images keep theirs. The backgrounds are composited with one
+    /// another as they are without this, into a layer below the rest of what `f` paints, and the
+    /// layer is faded as a whole, so that backgrounds painted over others do not add up as
+    /// translucent ones would: a translucent window shows what is behind it through all of its
+    /// backgrounds alike, as a translucent terminal does.
+    ///
+    /// The backgrounds of offscreen surfaces that `f` paints go into the layer too. Calls with the
+    /// same `id` in one frame share one layer, at the place of the first, which `bounds` contains
+    /// with all that they paint; `id` also names the layer's surface. Inside a layer, a call adds
+    /// to that layer. A view cached without an offscreen surface replays only what it painted into
+    /// the scene, so a view in a layer caches with `cached_offscreen`. At an `opacity` of 1.0 or
+    /// above, `f` paints as it does without this. This method should only be called as part of the
+    /// paint phase of element drawing.
+    pub fn with_background_layer<R>(
+        &mut self,
+        id: OffscreenSurfaceId,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let opacity = opacity.max(0.0);
+        if opacity >= 1.0 || self.background_layer.is_some() {
+            return f(self);
+        }
+        let key = (id, self.offscreen_depth);
+        let layer_scene = match self.background_layers.get_mut(&key) {
+            Some(layer) => mem::take(&mut layer.scene),
+            None => {
+                let snapped_bounds = self.cover_bounds(bounds);
+                let index = self.next_frame.scene.offscreen_surfaces.len();
+                let layer = PendingBackgroundLayer {
+                    index,
+                    scene: Scene::default(),
+                    bounds: snapped_bounds,
+                    content_mask: self.snapped_content_mask(),
+                    size: size(
+                        DevicePixels(snapped_bounds.size.width.0.ceil().max(1.) as i32),
+                        DevicePixels(snapped_bounds.size.height.0.ceil().max(1.) as i32),
+                    ),
+                    opacity,
+                };
+                // The layer's place, below everything that `f` paints over it.
+                self.next_frame.scene.insert_primitive(layer.composite(id));
+                if self.next_frame.scene.offscreen_surfaces.len() == index {
+                    return f(self);
+                }
+                self.background_layers.insert(key, layer);
+                Scene::default()
+            }
+        };
+        self.background_layer = Some(layer_scene);
+        let result = f(self);
+        let layer_scene = self.background_layer.take().unwrap_or_default();
+        if let Some(layer) = self.background_layers.get_mut(&key) {
+            layer.scene = layer_scene;
+            self.next_frame
+                .scene
+                .replace_offscreen_surface(layer.index, layer.composite(id));
+        }
+        result
+    }
+
+    /// Paints the quads that `f` paints with the rest of what is painted, rather than with the
+    /// backgrounds of a layer that [`Window::with_background_layer`] paints: for what is drawn as
+    /// a quad without being a background, as a rule below text.
+    pub fn with_foreground_quads<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let layer = self.background_layer.take();
+        let result = f(self);
+        self.background_layer = layer;
+        result
+    }
+
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
@@ -3835,7 +3976,7 @@ impl Window {
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
-        self.next_frame.scene.insert_primitive(Quad {
+        let quad = Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
@@ -3844,7 +3985,30 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
-        });
+        };
+        let Some(layer) = self.background_layer.as_mut() else {
+            self.next_frame.scene.insert_primitive(quad);
+            return;
+        };
+        // In a background layer, the fill goes to the layer and the border stays with the rest.
+        let widths = quad.border_widths;
+        let has_border = !quad.border_color.is_transparent()
+            && (widths.top.0 > 0.
+                || widths.right.0 > 0.
+                || widths.bottom.0 > 0.
+                || widths.left.0 > 0.);
+        if !quad.background.is_transparent() {
+            layer.insert_primitive(Quad {
+                border_color: transparent_black(),
+                ..quad
+            });
+        }
+        if has_border {
+            self.next_frame.scene.insert_primitive(Quad {
+                background: transparent_black().into(),
+                ..quad
+            });
+        }
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -4334,31 +4498,66 @@ impl Window {
         );
         let content_mask = self.snapped_content_mask();
         let dirty = dirty || self.refresh_offscreen_surfaces;
+        // Inside a background layer, the surface keeps its backgrounds apart from the rest in a
+        // surface of their own, which goes into the layer.
+        let layered = self.background_layer.is_some();
 
-        let scene = if dirty {
+        let (scene, background_scene) = if dirty {
             let offscreen_mask = ContentMask {
                 bounds: bounds.intersect(&self.content_mask().bounds),
             };
             let saved_content_masks =
                 mem::replace(&mut self.content_mask_stack, vec![offscreen_mask]);
             let main_scene = mem::take(&mut self.next_frame.scene);
+            let outer_layer = if layered {
+                self.background_layer.replace(Scene::default())
+            } else {
+                None
+            };
+            self.offscreen_depth += 1;
 
             paint(self);
 
+            self.offscreen_depth -= 1;
+            let depth = self.offscreen_depth;
+            self.background_layers
+                .retain(|(_, layer_depth), _| *layer_depth <= depth);
             let mut offscreen_scene = mem::take(&mut self.next_frame.scene);
             self.next_frame.scene = main_scene;
+            let background_scene = if layered {
+                mem::replace(&mut self.background_layer, outer_layer)
+            } else {
+                None
+            };
             self.content_mask_stack = saved_content_masks;
 
-            offscreen_scene.translate(point(
+            let offset = point(
                 ScaledPixels(-snapped_bounds.origin.x.0),
                 ScaledPixels(-snapped_bounds.origin.y.0),
-            ));
+            );
+            offscreen_scene.translate(offset);
             offscreen_scene.finish();
-            Some(Arc::new(offscreen_scene))
+            let background_scene = background_scene.map(|mut scene| {
+                scene.translate(offset);
+                scene.finish();
+                Arc::new(scene)
+            });
+            (Some(Arc::new(offscreen_scene)), background_scene)
         } else {
-            None
+            (None, None)
         };
 
+        if let Some(layer) = self.background_layer.as_mut() {
+            layer.insert_primitive(OffscreenSurface {
+                order: 0,
+                id: id.background_layer(),
+                bounds: snapped_bounds,
+                content_mask,
+                size: target_size,
+                opacity,
+                scene: background_scene,
+            });
+        }
         self.next_frame.scene.insert_primitive(OffscreenSurface {
             order: 0,
             id,

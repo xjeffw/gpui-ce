@@ -16,6 +16,7 @@ use wayland_client::{
     Proxy,
     protocol::{wl_output, wl_surface},
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_surface;
@@ -98,6 +99,9 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    /// The parts of the window that a `Blurred` background blurs, or None for all of it.
+    blur_region: Option<Vec<Bounds<Pixels>>>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -388,6 +392,8 @@ impl WaylandWindowState {
             surface,
             app_id: None,
             blur: None,
+            background_effect: None,
+            blur_region: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -481,6 +487,9 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
             blur.release();
+        }
+        if let Some(effect) = state.background_effect.take() {
+            effect.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -986,6 +995,12 @@ impl WaylandWindowStatePtr {
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
+            // A blur of the whole window follows its size.
+            if state.blur_region.is_none()
+                && state.background_appearance == WindowBackgroundAppearance::Blurred
+            {
+                update_background_effect(&mut state);
+            }
             (state.bounds.size, state.scale)
         };
 
@@ -1314,6 +1329,17 @@ impl PlatformWindow for WaylandWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
+    }
+
+    fn set_background_blur_region(&self, region: Option<Vec<Bounds<Pixels>>>) {
+        let mut state = self.borrow_mut();
+        if state.blur_region == region {
+            return;
+        }
+        state.blur_region = region;
+        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+            update_window(state);
+        }
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -1681,13 +1707,30 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
+    region.destroy();
+
+    update_background_effect(&mut state);
+    // KDE's protocol is the fallback for compositors without `ext-background-effect-v1`.
+    if state.globals.background_effect_manager.is_some() {
+        return;
+    }
     if let Some(ref blur_manager) = state.globals.blur_manager {
         if state.background_appearance == WindowBackgroundAppearance::Blurred {
             if state.blur.is_none() {
                 let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
             }
-            state.blur.as_ref().unwrap().commit();
+            let blur = state.blur.as_ref().unwrap();
+            // Without a region of its own, the blur covers the whole surface.
+            let region = state
+                .blur_region
+                .as_deref()
+                .map(|rects| blur_wl_region(&state.globals, rects));
+            blur.set_region(region.as_ref());
+            blur.commit();
+            if let Some(region) = region {
+                region.destroy();
+            }
         } else {
             // It probably doesn't hurt to clear the blur for opaque windows
             blur_manager.unset(&state.surface);
@@ -1696,7 +1739,56 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             }
         }
     }
+}
 
+/// A `wl_region` of `rects`, in surface-local coordinates.
+fn blur_wl_region(
+    globals: &Globals,
+    rects: &[Bounds<Pixels>],
+) -> wayland_client::protocol::wl_region::WlRegion {
+    let region = globals.compositor.create_region(&globals.qh, ());
+    for rect in rects {
+        let left = f32::from(rect.origin.x).round() as i32;
+        let top = f32::from(rect.origin.y).round() as i32;
+        let right = f32::from(rect.origin.x + rect.size.width).round() as i32;
+        let bottom = f32::from(rect.origin.y + rect.size.height).round() as i32;
+        if right > left && bottom > top {
+            region.add(left, top, right - left, bottom - top);
+        }
+    }
+    region
+}
+
+/// Asks the compositor, through `ext-background-effect-v1`, to blur what is behind a `Blurred`
+/// window: its blur region, or all of it. A transparent window asks for no blur, which keeps a
+/// compositor that blurs windows by rules of its own from blurring it. What shows behind an
+/// opaque window does not matter, so it leaves the choice to the compositor.
+fn update_background_effect(state: &mut WaylandWindowState) {
+    let Some(manager) = state.globals.background_effect_manager.as_ref() else {
+        return;
+    };
+    if state.background_appearance == WindowBackgroundAppearance::Opaque {
+        if let Some(effect) = state.background_effect.take() {
+            effect.destroy();
+        }
+        return;
+    }
+    let effect = state.background_effect.get_or_insert_with(|| {
+        manager.get_background_effect(&state.surface, &state.globals.qh, ())
+    });
+    let rects = if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        match state.blur_region.as_deref() {
+            Some(rects) => rects.to_vec(),
+            None => vec![Bounds {
+                origin: Point::default(),
+                size: state.bounds.size,
+            }],
+        }
+    } else {
+        Vec::new()
+    };
+    let region = blur_wl_region(&state.globals, &rects);
+    effect.set_blur_region(Some(&region));
     region.destroy();
 }
 

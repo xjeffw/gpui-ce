@@ -479,6 +479,110 @@ mod tests {
         });
     }
 
+    struct LayeredRoot {
+        nested: bool,
+    }
+
+    const LAYER_ID: OffscreenSurfaceId = OffscreenSurfaceId(456);
+    const NESTED_ID: OffscreenSurfaceId = OffscreenSurfaceId(789);
+
+    impl Render for LayeredRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let nested = self.nested;
+            crate::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let quad_bounds = crate::bounds(bounds.origin, crate::size(px(40.), px(40.)));
+                    window.with_background_layer(LAYER_ID, bounds, 0.5, |window| {
+                        if nested {
+                            window.paint_offscreen(NESTED_ID, quad_bounds, true, |window| {
+                                window.paint_quad(crate::fill(quad_bounds, rgb(0x112233)));
+                            });
+                            return;
+                        }
+                        window.paint_quad(crate::fill(quad_bounds, rgb(0x112233)));
+                        window.paint_quad(
+                            crate::fill(quad_bounds, rgb(0x223344))
+                                .border_widths(px(2.))
+                                .border_color(rgb(0x445566)),
+                        );
+                        window.with_foreground_quads(|window| {
+                            window.paint_quad(crate::fill(quad_bounds, rgb(0x334455)));
+                        });
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[crate::test]
+    fn background_layer_fades_backgrounds_together_below_the_rest(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| LayeredRoot { nested: false });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let scene = &window.rendered_frame.scene;
+            let layer = scene
+                .offscreen_surfaces
+                .iter()
+                .find(|surface| surface.id == LAYER_ID)
+                .expect("the layer's surface");
+            assert_eq!(layer.opacity, 0.5);
+            // Both fills, the bordered quad's without its border, are composited in the layer.
+            let layer_scene = layer.scene.as_deref().expect("the layer's backgrounds");
+            assert_eq!(layer_scene.quads.len(), 2);
+            assert!(
+                layer_scene
+                    .quads
+                    .iter()
+                    .all(|quad| quad.border_color.is_transparent())
+            );
+            // The border and the foreground quad stay in the scene, above the layer.
+            assert_eq!(scene.quads.len(), 2);
+            assert!(scene.quads.iter().all(|quad| quad.order > layer.order));
+            assert!(
+                scene
+                    .quads
+                    .iter()
+                    .any(|quad| quad.background.is_transparent())
+            );
+        });
+    }
+
+    #[crate::test]
+    fn background_layer_of_one_surface_fades_that_surfaces_backgrounds(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| LayeredRoot { nested: true });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let scene = &window.rendered_frame.scene;
+            // The nested surface keeps what is not a background, here nothing.
+            let nested = scene
+                .offscreen_surfaces
+                .iter()
+                .find(|surface| surface.id == NESTED_ID)
+                .expect("the nested surface");
+            assert!(nested.scene.as_deref().unwrap().quads.is_empty());
+            // Its backgrounds are a surface of their own, which takes the layer's place.
+            let backgrounds = scene
+                .offscreen_surfaces
+                .iter()
+                .find(|surface| surface.id == NESTED_ID.background_layer())
+                .expect("the nested surface's backgrounds");
+            assert_eq!(backgrounds.opacity, 0.5);
+            assert_eq!(backgrounds.scene.as_deref().unwrap().quads.len(), 1);
+            assert!(backgrounds.order < nested.order);
+            assert!(
+                scene
+                    .offscreen_surfaces
+                    .iter()
+                    .all(|surface| surface.id != LAYER_ID),
+                "a layer of one surface needs no texture of its own"
+            );
+        });
+    }
+
     #[crate::test]
     fn unpresented_offscreen_capture_carries_into_the_next_draw(cx: &mut TestAppContext) {
         let (root, cx) = cx.add_window_view(|_, cx| SurfaceRoot {

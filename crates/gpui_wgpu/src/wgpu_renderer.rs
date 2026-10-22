@@ -17,7 +17,21 @@ use log::warn;
 fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
     filters.iter().fold(0.0, |acc, filter| match filter {
         ScaledFilter::Blur(radius) => acc.max(radius.0),
+        ScaledFilter::Saturate(_) | ScaledFilter::Noise(_) => acc,
     })
+}
+
+/// How a scene-space filter chain adjusts what it blurs: the factor by which it scales the
+/// saturation, the product of its saturations, and the amplitude of the noise it adds, the sum
+/// of its noises up to 1.0. Exhaustive for the same reason as [`max_blur_radius`].
+fn blur_adjustments(filters: &[ScaledFilter]) -> (f32, f32) {
+    filters
+        .iter()
+        .fold((1.0, 0.0), |(saturation, noise), filter| match filter {
+            ScaledFilter::Blur(_) => (saturation, noise),
+            ScaledFilter::Saturate(factor) => (saturation * factor, noise),
+            ScaledFilter::Noise(amplitude) => (saturation, (noise + amplitude).min(1.0)),
+        })
 }
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -88,6 +102,13 @@ struct BlurParams {
     /// origin, so a stationary element blurs identically at every window size); 0.0 = 1:1 copy
     /// (the scene blit, which must not downsample). Downsample pass only.
     downsample: f32,
+    /// The factor by which the composite scales the saturation of the blur, 1.0 to leave it
+    /// (composite pass only; [`blur_adjustments`]).
+    saturation: f32,
+    /// The amplitude of the white noise the composite adds to the blur (composite pass only).
+    noise: f32,
+    /// Pads the struct to the 16-byte multiple that WGSL rounds the uniform's size up to.
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -1993,7 +2014,7 @@ impl WgpuRenderer {
                                             boundary.corner_radii.bottom_right.0,
                                             boundary.corner_radii.bottom_left.0,
                                         ],
-                                        max_blur_radius(&boundary.filters),
+                                        &boundary.filters,
                                         boundary.opacity,
                                         false,
                                     );
@@ -2481,7 +2502,8 @@ impl WgpuRenderer {
         pass.draw(0..3, 0..1);
     }
 
-    /// Blur `source` (full-resolution) and composite the result into `target`, clipped to
+    /// Blur `source` (full-resolution) by the largest radius of `filters` and composite the
+    /// result, with the saturation and noise of `filters`, into `target`, clipped to
     /// `bounds`/`corner_radii`/`content_mask` and modulated by `opacity`. Shared by the backdrop
     /// and content-filter paths. Uses the half-resolution ping/pong textures as scratch.
     #[allow(clippy::too_many_arguments)]
@@ -2493,11 +2515,13 @@ impl WgpuRenderer {
         bounds: Bounds<ScaledPixels>,
         content_mask: Bounds<ScaledPixels>,
         corner_radii: [f32; 4],
-        blur_radius: f32,
+        filters: &[ScaledFilter],
         opacity: f32,
         // Backdrop clips to the rounded rect; content (`filter`) bleeds past its bounds.
         clip_rounded: bool,
     ) {
+        let blur_radius = max_blur_radius(filters);
+        let (saturation, noise) = blur_adjustments(filters);
         // Sigma is halved because the blur runs at half resolution.
         let sigma = (blur_radius * 0.5).max(0.0);
         if sigma <= 0.0 {
@@ -2609,6 +2633,8 @@ impl WgpuRenderer {
             corner_radii,
             opacity,
             clip_rounded: if clip_rounded { 1.0 } else { 0.0 },
+            saturation,
+            noise,
             ..Default::default()
         };
         let bind_group = self.make_blur_bind_group(params, &ping);
@@ -2663,7 +2689,7 @@ impl WgpuRenderer {
                 filter.corner_radii.bottom_right.0,
                 filter.corner_radii.bottom_left.0,
             ],
-            max_blur_radius(&filter.filters),
+            &filter.filters,
             filter.opacity,
             true,
         );
@@ -3176,5 +3202,42 @@ impl RenderingParameters {
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chain_blurs_once_and_adjusts_the_blur_by_all_its_adjustments() {
+        let filters = [
+            ScaledFilter::Blur(ScaledPixels(8.)),
+            ScaledFilter::Saturate(1.5),
+            ScaledFilter::Noise(0.02),
+            ScaledFilter::Blur(ScaledPixels(20.)),
+            ScaledFilter::Saturate(2.),
+            ScaledFilter::Noise(0.03),
+        ];
+        assert_eq!(max_blur_radius(&filters), 20.);
+        let (saturation, noise) = blur_adjustments(&filters);
+        assert_eq!(saturation, 3.);
+        assert!((noise - 0.05).abs() < 1e-6);
+        assert_eq!(
+            blur_adjustments(&[ScaledFilter::Blur(ScaledPixels(8.))]),
+            (1.0, 0.0),
+            "a blur alone is not adjusted"
+        );
+        assert_eq!(
+            blur_adjustments(&[ScaledFilter::Noise(0.8), ScaledFilter::Noise(0.8)]).1,
+            1.0
+        );
+    }
+
+    #[test]
+    fn blur_params_fill_whole_uniform_rows() {
+        // WGSL rounds the size of `BlurParams`, whose `corner_radii` is a vec4, up to a multiple
+        // of 16 bytes, and a binding must be at least that large.
+        assert_eq!(std::mem::size_of::<BlurParams>() % 16, 0);
     }
 }

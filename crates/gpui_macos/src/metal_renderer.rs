@@ -23,6 +23,8 @@ use gpui::{
 fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
     filters.iter().fold(0.0, |acc, filter| match filter {
         ScaledFilter::Blur(radius) => acc.max(radius.0),
+        // Not implemented by this backend yet, which blurs without adjusting the blur.
+        ScaledFilter::Saturate(_) | ScaledFilter::Noise(_) => acc,
     })
 }
 #[cfg(any(test, feature = "test-support"))]

@@ -364,10 +364,22 @@ pub struct BoxShadow {
 /// A graphical filter that can be applied either to an element's own content
 /// (via [`Styled::filter`], like CSS `filter`) or to the content rendered behind
 /// it (via [`Styled::backdrop_filter`], like CSS `backdrop-filter`).
+///
+/// A chain blurs once, by the largest radius of its blurs, and [`Filter::Saturate`] and
+/// [`Filter::Noise`] then adjust what it blurred, as a compositor's blur behind a translucent
+/// window does: they take effect only in a chain that blurs.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Filter {
     /// A gaussian blur with the given radius, in logical pixels. Maps to CSS `blur(<px>)`.
     Blur(Pixels),
+    /// Scales the saturation of what the chain blurs by the given factor, as CSS
+    /// `saturate(<number>)` does: 1.0 leaves it, 0.0 makes it gray, and above 1.0 its colors
+    /// are more vivid. Several multiply.
+    Saturate(f32),
+    /// Adds white noise of the given amplitude, from 0.0 to 1.0 of the color range, to what the
+    /// chain blurs, which breaks up the banding of a smooth blur as the blur of compositors
+    /// does. Several add up.
+    Noise(f32),
 }
 
 impl Filter {
@@ -380,6 +392,8 @@ impl Filter {
     pub fn is_identity(&self) -> bool {
         match self {
             Filter::Blur(radius) => *radius <= Pixels::ZERO,
+            Filter::Saturate(factor) => !factor.is_finite() || *factor == 1.0,
+            Filter::Noise(amplitude) => amplitude.is_nan() || *amplitude <= 0.0,
         }
     }
 
@@ -388,6 +402,8 @@ impl Filter {
     pub fn scale(&self, factor: f32) -> ScaledFilter {
         match self {
             Filter::Blur(radius) => ScaledFilter::Blur(radius.scale(factor)),
+            Filter::Saturate(saturation) => ScaledFilter::Saturate(saturation.max(0.0)),
+            Filter::Noise(amplitude) => ScaledFilter::Noise(amplitude.clamp(0.0, 1.0)),
         }
     }
 }
@@ -403,6 +419,20 @@ impl Filter {
 pub enum ScaledFilter {
     /// A gaussian blur with the given radius, in scaled (device) pixels.
     Blur(ScaledPixels),
+    /// [`Filter::Saturate`]: the factor by which the saturation of what the chain blurs is
+    /// scaled, at least 0.0.
+    Saturate(f32),
+    /// [`Filter::Noise`]: the amplitude of the white noise added to what the chain blurs, from
+    /// 0.0 to 1.0.
+    Noise(f32),
+}
+
+impl ScaledFilter {
+    /// Whether this filter blurs. Painting drops a chain without a blur, whose other filters
+    /// would have no blur to adjust.
+    pub fn is_blur(&self) -> bool {
+        matches!(self, ScaledFilter::Blur(_))
+    }
 }
 
 /// How to handle whitespace in text
@@ -1555,5 +1585,80 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+
+    #[test]
+    fn filters_that_adjust_a_blur_are_identities_where_they_change_nothing() {
+        assert!(Filter::Saturate(1.0).is_identity());
+        assert!(Filter::Saturate(f32::NAN).is_identity());
+        assert!(!Filter::Saturate(1.5).is_identity());
+        assert!(!Filter::Saturate(0.0).is_identity());
+        assert!(Filter::Noise(0.0).is_identity());
+        assert!(Filter::Noise(-0.5).is_identity());
+        assert!(Filter::Noise(f32::NAN).is_identity());
+        assert!(!Filter::Noise(0.02).is_identity());
+    }
+
+    #[test]
+    fn filters_that_adjust_a_blur_keep_their_values_at_any_scale() {
+        assert_eq!(
+            Filter::Blur(px(10.)).scale(2.),
+            ScaledFilter::Blur(ScaledPixels(20.))
+        );
+        assert_eq!(Filter::Saturate(1.5).scale(2.), ScaledFilter::Saturate(1.5));
+        assert_eq!(Filter::Saturate(-1.).scale(2.), ScaledFilter::Saturate(0.));
+        assert_eq!(Filter::Noise(0.02).scale(2.), ScaledFilter::Noise(0.02));
+        assert_eq!(Filter::Noise(3.).scale(2.), ScaledFilter::Noise(1.));
+    }
+
+    struct Backdrops {
+        filters: Vec<Vec<Filter>>,
+    }
+
+    impl crate::Render for Backdrops {
+        fn render(
+            &mut self,
+            _: &mut crate::Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{ParentElement, Styled};
+            crate::div().size_full().children(
+                self.filters
+                    .iter()
+                    .map(|filters| crate::div().size(px(20.)).backdrop_filter(filters.clone())),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn a_backdrop_chain_paints_only_with_a_blur(cx: &mut crate::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| Backdrops {
+            filters: vec![
+                vec![
+                    Filter::Blur(px(10.)),
+                    Filter::Saturate(1.5),
+                    Filter::Noise(0.02),
+                    Filter::Saturate(1.0),
+                ],
+                // Nothing to adjust without a blur.
+                vec![Filter::Saturate(1.5), Filter::Noise(0.02)],
+            ],
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.backdrop_filters.len(), 1);
+            let scale = window.scale_factor();
+            assert_eq!(
+                scene.backdrop_filters[0].filters.as_slice(),
+                &[
+                    ScaledFilter::Blur(ScaledPixels(10. * scale)),
+                    ScaledFilter::Saturate(1.5),
+                    ScaledFilter::Noise(0.02),
+                ],
+                "identities are dropped, and the chain keeps its order"
+            );
+        });
     }
 }

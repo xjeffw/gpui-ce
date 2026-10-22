@@ -1372,10 +1372,10 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 //   1. `fs_blur_downsample` copies a source texture into the half-resolution blur texture
 //      (also reused to blit the offscreen scene into the swapchain).
 //   2. `fs_blur` runs one axis of a separable gaussian; the host invokes it twice.
-//   3. `fs_blur_composite` samples the blurred texture and composites it into a rounded
-//      rectangle, clipped and modulated by opacity. A backdrop first erases what it covers
-//      with `fs_blur_backdrop_erase`, so that the blur replaces the backdrop rather than
-//      stacking on it.
+//   3. `fs_blur_composite` samples the blurred texture, scales its saturation and adds noise as
+//      the chain asks, and composites it into a rounded rectangle, clipped and modulated by
+//      opacity. A backdrop first erases what it covers with `fs_blur_backdrop_erase`, so that
+//      the blur replaces the backdrop rather than stacking on it.
 //
 // Notes (review #5, #7): the scene/blur textures use the swapchain's (typically non-sRGB)
 // format, so the gaussian runs on gamma-encoded values rather than linear light — consistent
@@ -1401,6 +1401,12 @@ struct BlurParams {
     // 1.0 = snapped 2:1 box downsample (anchor the half-res grid to a fixed 2px grid at the origin
     // so a stationary element blurs identically at every window size); 0.0 = 1:1 copy (scene blit).
     downsample: f32,
+    // The factor by which the composite scales the saturation of the blur, 1.0 to leave it.
+    saturation: f32,
+    // The amplitude of the white noise that the composite adds to the blur.
+    noise: f32,
+    pad0: f32,
+    pad1: f32,
 }
 
 @group(1) @binding(0) var<uniform> blur_locals: BlurParams;
@@ -1488,6 +1494,30 @@ fn blur_composite_weight(input: BlurVarying) -> f32 {
     return coverage * blur_locals.opacity;
 }
 
+// Sin-less white noise by David Hoskins (MIT License), https://www.shadertoy.com/view/4djSRW,
+// as niri's blur uses it: a value in [0, 1) for each pixel position.
+fn blur_noise_hash(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// What a compositor does to a blur besides blurring, as niri does to the blur behind a window:
+// scales its saturation around its Rec. 709 luma, as CSS `saturate()` does, and adds white noise
+// that breaks up its banding. `color` is premultiplied, and both are linear in it, so they scale
+// with its alpha; the result stays a valid premultiplied color.
+fn blur_adjust(color: vec4<f32>, position: vec2<f32>) -> vec4<f32> {
+    var rgb = color.rgb;
+    if (blur_locals.saturation != 1.0) {
+        let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        rgb = mix(vec3<f32>(luma), rgb, blur_locals.saturation);
+    }
+    if (blur_locals.noise > 0.0) {
+        rgb += (blur_noise_hash(position) - 0.5) * blur_locals.noise * color.a;
+    }
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(color.a)), color.a);
+}
+
 @fragment
 fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
     let c = blur_composite_weight(input);
@@ -1498,7 +1528,7 @@ fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
     // texel p/2 at every window size, so the composite stays put rather than wobbling on resize.
     let blur_span = 2.0 * floor(globals.viewport_size * 0.5);
     let uv = input.position.xy / blur_span;
-    let blurred = textureSampleLevel(t_blur, s_blur, uv, 0.0);
+    let blurred = blur_adjust(textureSampleLevel(t_blur, s_blur, uv, 0.0), input.position.xy);
 
     // The blurred sample is premultiplied (blurring against the transparent, rgb=0 surround scales
     // rgb with the fading alpha), so output premultiplied. A content-filter group is transparent

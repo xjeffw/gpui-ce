@@ -890,7 +890,7 @@ pub struct BackdropFilter {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     /// The filter chain applied to the backdrop, in scene (device-pixel) space. Identity filters
-    /// are dropped at paint time, so a `BackdropFilter` is only emitted when this is non-empty.
+    /// are dropped at paint time, so a `BackdropFilter` is only emitted when this holds a blur.
     ///
     /// Inline capacity is 4: a `SmallVec<[ScaledFilter; 4]>` is the same size as capacity 1 here
     /// (the heap repr already occupies that space), so chains up to 4 filters avoid allocating
@@ -918,7 +918,8 @@ pub struct FilterBoundary {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     /// The filter chain applied to the isolated group, in scene (device-pixel) space. Identity
-    /// filters are dropped at paint time, so a `FilterBoundary` is only emitted when non-empty.
+    /// filters are dropped at paint time, so a `FilterBoundary` is only emitted when this holds a
+    /// blur.
     /// Inline capacity 4 (same struct size as 1 here — see [`BackdropFilter::filters`]).
     pub filters: SmallVec<[ScaledFilter; 4]>,
     pub opacity: f32,

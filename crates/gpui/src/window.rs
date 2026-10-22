@@ -3875,7 +3875,8 @@ impl Window {
     /// `backdrop-filter` effect (frosted glass). Typically the element then paints a translucent
     /// background quad on top so its color tints the blurred backdrop.
     ///
-    /// Does nothing when `filters` produce no visible blur.
+    /// Does nothing when `filters` produce no visible blur, which the other filters of the chain
+    /// adjust.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_backdrop_filter(
@@ -3892,7 +3893,7 @@ impl Window {
             .filter(|filter| !filter.is_identity())
             .map(|filter| filter.scale(scale_factor))
             .collect();
-        if filters.is_empty() {
+        if !filters.iter().any(ScaledFilter::is_blur) {
             return;
         }
 
@@ -3911,8 +3912,8 @@ impl Window {
     /// composites the result back into the rounded rectangle described by `bounds` and
     /// `corner_radii` — the CSS `filter` effect (e.g. blurring an element and its children).
     ///
-    /// When `filters` produce no visible blur this simply runs `f` with no offscreen
-    /// indirection.
+    /// When `filters` produce no visible blur, which the other filters of the chain adjust, this
+    /// simply runs `f` with no offscreen indirection.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn with_filter_layer<R>(
@@ -3930,7 +3931,7 @@ impl Window {
             .filter(|filter| !filter.is_identity())
             .map(|filter| filter.scale(scale_factor))
             .collect();
-        if filters.is_empty() {
+        if !filters.iter().any(ScaledFilter::is_blur) {
             return f(self);
         }
 

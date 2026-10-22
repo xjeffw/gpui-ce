@@ -72,6 +72,34 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Scale the saturation of the blurred content behind this element by `factor`, like CSS
+    /// `backdrop-filter: saturate(<factor>)`, as compositors make what shows through translucent
+    /// panels more vivid: above 1.0 its colors are stronger. It adjusts the blur of
+    /// [`Styled::backdrop_blur`] and has no effect without one.
+    ///
+    /// *Appends* to the element's backdrop-filter chain.
+    fn backdrop_saturate(mut self, factor: f32) -> Self {
+        self.style()
+            .backdrop_filter
+            .get_or_insert_with(Vec::new)
+            .push(Filter::Saturate(factor));
+        self
+    }
+
+    /// Add white noise of `amplitude`, from 0.0 to 1.0 of the color range, to the blurred
+    /// content behind this element, which breaks up the banding of a smooth blur as the blur of
+    /// compositors does. It adjusts the blur of [`Styled::backdrop_blur`] and has no effect
+    /// without one.
+    ///
+    /// *Appends* to the element's backdrop-filter chain.
+    fn backdrop_noise(mut self, amplitude: f32) -> Self {
+        self.style()
+            .backdrop_filter
+            .get_or_insert_with(Vec::new)
+            .push(Filter::Noise(amplitude));
+        self
+    }
+
     /// Set (replacing any existing) the full list of filters applied to the content behind this
     /// element, like CSS `backdrop-filter`. To add a single filter to the chain instead, use the
     /// convenience setters such as [`Styled::backdrop_blur`].

@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle,
+    Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -49,7 +49,44 @@ pub struct ShapedLine {
     pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
 }
 
+/// The decoration runs `runs` paint a line in: one per stretch of text whose color, background,
+/// underline and strikethrough stay the same.
+pub(crate) fn decoration_runs_for(runs: &[TextRun]) -> SmallVec<[DecorationRun; 32]> {
+    let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+    for run in runs {
+        if let Some(last_run) = decoration_runs.last_mut()
+            && last_run.color == run.color
+            && last_run.underline == run.underline
+            && last_run.strikethrough == run.strikethrough
+            && last_run.background_color == run.background_color
+        {
+            last_run.len += run.len as u32;
+            continue;
+        }
+        decoration_runs.push(DecorationRun {
+            len: run.len as u32,
+            color: run.color,
+            background_color: run.background_color,
+            underline: run.underline,
+            strikethrough: run.strikethrough,
+        });
+    }
+    decoration_runs
+}
+
 impl ShapedLine {
+    /// A line laid out as `layout`, painted in the colors and decorations of `runs`, whose fonts
+    /// and lengths are those `layout` was laid out in. A cache of layouts, which are the same
+    /// whatever their colors as long as their runs change colors at the same places, paints a
+    /// layout it holds in new colors this way without shaping its text again.
+    pub fn new(layout: Arc<LineLayout>, text: SharedString, runs: &[TextRun]) -> Self {
+        Self {
+            layout,
+            text,
+            decoration_runs: decoration_runs_for(runs),
+        }
+    }
+
     /// The length of the line in utf-8 bytes.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {

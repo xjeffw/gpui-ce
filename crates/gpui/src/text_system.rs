@@ -320,6 +320,69 @@ impl TextSystem {
         }
     }
 
+    /// Appends to `font_runs` (after clearing it) the font runs that `runs` lay out in: one run
+    /// per stretch of text in the same font whose color, underline and strikethrough do not
+    /// change, since a glyph is painted in one decoration and so never crosses a change of one.
+    /// A change of background color alone does not split a run.
+    pub fn font_runs_into(&self, runs: &[TextRun], font_runs: &mut Vec<FontRun>) {
+        font_runs.clear();
+        let mut last_run = None::<&TextRun>;
+        for run in runs {
+            let decoration_changed = if let Some(last_run) = last_run
+                && last_run.color == run.color
+                && last_run.underline == run.underline
+                && last_run.strikethrough == run.strikethrough
+            // we do not consider differing background color relevant, as it does not affect glyphs
+            // && last_run.background_color == run.background_color
+            {
+                false
+            } else {
+                last_run = Some(run);
+                true
+            };
+
+            let font_id = self.resolve_font(&run.font);
+            if let Some(font_run) = font_runs.last_mut()
+                && font_id == font_run.font_id
+                && !decoration_changed
+            {
+                font_run.len += run.len;
+            } else {
+                font_runs.push(FontRun {
+                    len: run.len,
+                    font_id,
+                });
+            }
+        }
+    }
+
+    /// Lays out one line of text in `runs` as [`WindowTextSystem::layout_line`] does, but without
+    /// a window's cache of the frame's layouts. It takes no window, so it can lay out text on any
+    /// thread, as a caller with a cache of its own does, which can paint the layout in any colors
+    /// with the same boundaries through [`ShapedLine::new`].
+    pub fn layout_line_uncached(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+    ) -> Arc<LineLayout> {
+        debug_assert!(
+            text.find('\n').is_none(),
+            "text argument should not contain newlines"
+        );
+        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        self.font_runs_into(runs, &mut font_runs);
+        let mut layout = self
+            .platform_text_system
+            .layout_line(text, font_size, &font_runs);
+        if let Some(force_width) = force_width {
+            line_layout::apply_force_width_to_layout(&mut layout, force_width);
+        }
+        self.font_runs_pool.lock().push(font_runs);
+        Arc::new(layout)
+    }
+
     /// Get the rasterized size and location of a specific, rendered glyph.
     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let raster_bounds = self.raster_bounds.upgradable_read();
@@ -406,33 +469,8 @@ impl WindowTextSystem {
             "text argument should not contain newlines"
         );
 
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
-        for run in runs {
-            if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += run.len as u32;
-                continue;
-            }
-            decoration_runs.push(DecorationRun {
-                len: run.len as u32,
-                color: run.color,
-                background_color: run.background_color,
-                underline: run.underline,
-                strikethrough: run.strikethrough,
-            });
-        }
-
         let layout = self.layout_line(&text, font_size, runs, force_width);
-
-        ShapedLine {
-            layout,
-            text,
-            decoration_runs,
-        }
+        ShapedLine::new(layout, text, runs)
     }
 
     /// Shape the given line using a caller-provided content hash as the cache key.
@@ -454,25 +492,7 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
-        for run in runs {
-            if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += run.len as u32;
-                continue;
-            }
-            decoration_runs.push(DecorationRun {
-                len: run.len as u32,
-                color: run.color,
-                background_color: run.background_color,
-                underline: run.underline,
-                strikethrough: run.strikethrough,
-            });
-        }
+        let decoration_runs = line::decoration_runs_for(runs);
 
         let mut used_force_width = force_width;
         let layout = self.layout_line_by_hash(
@@ -658,37 +678,8 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        self.text_system.font_runs_into(runs, &mut font_runs);
 
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
@@ -1211,5 +1202,65 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TestAppContext, TestDispatcher, blue, font, green, red};
+
+    fn runs(colors: [Hsla; 3], background: Option<Hsla>) -> Vec<TextRun> {
+        colors
+            .into_iter()
+            .map(|color| TextRun {
+                len: 2,
+                font: font("Dummy"),
+                color,
+                background_color: background,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn font_runs_split_where_decorations_change_and_not_where_backgrounds_do() {
+        let cx = TestAppContext::build(TestDispatcher::new(0), None);
+        let text_system = cx.text_system();
+        let mut font_runs = Vec::new();
+        text_system.font_runs_into(&runs([red(), red(), blue()], None), &mut font_runs);
+        assert_eq!(
+            font_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            [4, 2]
+        );
+        let mut backgrounds = runs([red(), red(), red()], None);
+        backgrounds[1].background_color = Some(green());
+        text_system.font_runs_into(&backgrounds, &mut font_runs);
+        assert_eq!(font_runs.iter().map(|run| run.len).collect::<Vec<_>>(), [6]);
+    }
+
+    #[test]
+    fn a_layout_paints_in_new_colors_as_shaping_in_them_would() {
+        let cx = TestAppContext::build(TestDispatcher::new(0), None);
+        let text_system = cx.text_system();
+        let window_text_system = WindowTextSystem::new(Arc::clone(text_system));
+        let painted = runs([red(), blue(), red()], Some(green()));
+        let shaped = window_text_system.shape_line("abcdef".into(), px(16.), &painted, None);
+        // Laid out in other colors that change at the same places.
+        let layout = text_system.layout_line_uncached(
+            "abcdef",
+            px(16.),
+            &runs([blue(), red(), blue()], None),
+            None,
+        );
+        let repainted = ShapedLine::new(layout, "abcdef".into(), &painted);
+        assert_eq!(
+            format!("{:?}", repainted.layout),
+            format!("{:?}", shaped.layout)
+        );
+        assert_eq!(
+            format!("{:?}", repainted.decoration_runs),
+            format!("{:?}", shaped.decoration_runs)
+        );
     }
 }

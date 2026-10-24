@@ -784,7 +784,7 @@ impl LineLayoutCache {
 // loop must not advance the cell counter for these zero-advance glyphs,
 // otherwise they get displaced into the next cell. We detect them by checking
 // whether shaped x has advanced by at least half a cell beyond the last base.
-fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+pub(crate) fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
     // NEG_INFINITY ensures the first glyph is always classified as a base.
     let mut last_base_shaped_x = px(f32::NEG_INFINITY);

@@ -1204,7 +1204,8 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint pad;
-    uint grayscale;
+    // The Rust struct's `grayscale` in the low byte and `nearest` in the next; the rest is padding.
+    uint flags;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
@@ -1243,13 +1244,24 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     return output;
 }
 
+// The texel of `t_sprite` at `tile_position`, the one that a nearest filter samples.
+int3 nearest_sprite_texel(float2 tile_position) {
+    float2 size;
+    t_sprite.GetDimensions(size.x, size.y);
+    int2 texel = clamp(int2(floor(tile_position * size)), int2(0, 0), int2(size) - int2(1, 1));
+    return int3(texel, 0);
+}
+
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    if (((sprite.flags >> 8) & 0xFFu) != 0u) {
+        sample = t_sprite.Load(nearest_sprite_texel(input.tile_position));
+    }
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
-    if ((sprite.grayscale & 0xFFu) != 0u) {
+    if ((sprite.flags & 0xFFu) != 0u) {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }

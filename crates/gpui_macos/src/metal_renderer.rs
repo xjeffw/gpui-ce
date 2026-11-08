@@ -2086,6 +2086,7 @@ impl MetalRenderer {
             order: surface.order,
             pad: 0,
             grayscale: false,
+            nearest: false,
             opacity: surface.opacity,
             bounds: surface.bounds,
             content_mask: surface.content_mask,

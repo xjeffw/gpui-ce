@@ -48,6 +48,8 @@ js-sys = "0.3"
 
 [dev-dependencies]
 criterion.workspace = true
+# The WGSL front end of the naga that wgpu builds with, which validates the shaders in a test.
+naga = { git = "https://github.com/zed-industries/wgpu.git", rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88", features = ["wgsl-in"] }
 
 [[bench]]
 name = "layout_line"

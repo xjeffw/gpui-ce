@@ -1092,6 +1092,10 @@ pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32,
     pub grayscale: bool,
+    /// Whether the texture is sampled at the nearest texel rather than filtered linearly, so that
+    /// an enlarged image shows each of its pixels as a block of device pixels. It fills a byte of
+    /// `grayscale`'s padding, which the shaders read as one word of flags.
+    pub nearest: bool,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,

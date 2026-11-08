@@ -1264,7 +1264,8 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 struct PolychromeSprite {
     order: u32,
     pad: u32,
-    grayscale: u32,
+    // The Rust struct's `grayscale` in the low byte and `nearest` in the next; the rest is padding.
+    flags: u32,
     opacity: f32,
     bounds: Bounds,
     content_mask: Bounds,
@@ -1293,19 +1294,30 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     return out;
 }
 
+// The texel of `t_sprite` at `tile_position`, the one that a nearest filter samples.
+fn nearest_sprite_texel(tile_position: vec2<f32>) -> vec2<i32> {
+    let size = vec2<i32>(textureDimensions(t_sprite, 0));
+    let texel = vec2<i32>(floor(tile_position * vec2<f32>(size)));
+    return clamp(texel, vec2<i32>(0), size - vec2<i32>(1));
+}
+
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    var sample = textureSample(t_sprite, s_sprite, input.tile_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = b_poly_sprites[input.sprite_id];
+    // A load has no uniformity requirement, unlike a sample, so it can follow the sprite's flag.
+    if (((sprite.flags >> 8u) & 0xFFu) != 0u) {
+        sample = textureLoad(t_sprite, nearest_sprite_texel(input.tile_position), 0);
+    }
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
-    if ((sprite.grayscale & 0xFFu) != 0u) {
+    if ((sprite.flags & 0xFFu) != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }

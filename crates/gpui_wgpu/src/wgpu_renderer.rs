@@ -2257,6 +2257,7 @@ impl WgpuRenderer {
             order: surface.order,
             pad: 0,
             grayscale: false,
+            nearest: false,
             opacity: surface.opacity,
             bounds: surface.bounds,
             content_mask: surface.content_mask,
@@ -3232,6 +3233,25 @@ mod tests {
             blur_adjustments(&[ScaledFilter::Noise(0.8), ScaledFilter::Noise(0.8)]).1,
             1.0
         );
+    }
+
+    #[test]
+    fn the_shaders_parse_and_validate() {
+        let base = include_str!("shaders.wgsl");
+        let subpixel = format!(
+            "enable dual_source_blending;\n{base}\n{}",
+            include_str!("shaders_subpixel.wgsl")
+        );
+        for (name, source) in [("shaders.wgsl", base), ("shaders_subpixel.wgsl", &subpixel)] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
+        }
     }
 
     #[test]

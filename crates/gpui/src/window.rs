@@ -4288,6 +4288,7 @@ impl Window {
                 order: 0,
                 pad: 0,
                 grayscale: false,
+                nearest: false,
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
@@ -4366,6 +4367,10 @@ impl Window {
     /// Paint an image into the scene for the next frame at the current z-index.
     /// This method will panic if the frame_index is not valid
     ///
+    /// With `nearest`, each device pixel takes the image pixel under its center instead of a
+    /// blend of the nearest ones, so that an image enlarged by a whole number shows its pixels as
+    /// sharp squares.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_image(
         &mut self,
@@ -4374,6 +4379,7 @@ impl Window {
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
+        nearest: bool,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -4403,6 +4409,7 @@ impl Window {
             order: 0,
             pad: 0,
             grayscale,
+            nearest,
             bounds,
             content_mask,
             corner_radii,

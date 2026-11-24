@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use util::ResultExt;
+use ::util::ResultExt;
 use windows::{
     Win32::{
         Foundation::HWND,

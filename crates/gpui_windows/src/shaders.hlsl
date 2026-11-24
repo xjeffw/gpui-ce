@@ -1271,11 +1271,35 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 
 /*
 **
+**              Offscreen surfaces
+**
+** The cached texture of an offscreen surface, drawn as a polychrome sprite whose tile is the
+** whole texture, with a premultiplied blend.
+*/
+
+PolychromeSpriteVertexOutput offscreen_surface_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+    return polychrome_sprite_vertex(vertex_id, sprite_id);
+}
+
+float4 offscreen_surface_fragment(PolychromeSpriteFragmentInput input): SV_Target {
+    PolychromeSprite sprite = poly_sprites[input.sprite_id];
+    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    // The texture holds premultiplied source-over results; the composite opacity scales color
+    // and alpha alike to keep them premultiplied.
+    return sample * (sprite.opacity * saturate(0.5 - distance));
+}
+
+/*
+**
 **              Blur (backdrop-filter / filter)
 **
 ** Shared by backdrop and content blur. The source texture is bound at t0 (t_sprite) and the
 ** parameters in the BlurParams constant buffer at b1. Three passes: downsample (full -> half
-** res), separable gaussian (run twice), and a composite into a rounded rectangle.
+** res), separable gaussian (run twice), and a composite into a rounded rectangle, which scales
+** the blur's saturation and adds noise as the chain asks. A backdrop first erases what it
+** covers with `blur_backdrop_erase_fragment`, so that the blur replaces the backdrop rather than
+** stacking on it.
 */
 
 cbuffer BlurParams: register(b1) {
@@ -1293,6 +1317,12 @@ cbuffer BlurParams: register(b1) {
     // Spacing between taps in pixels (gaussian passes only); >1 lets `blur_tap_count` taps span
     // very large radii without truncating the gaussian.
     float blur_tap_step;
+    // The factor by which the composite scales the saturation of the blur, 1.0 to leave it.
+    float blur_saturation;
+    // The amplitude of the white noise that the composite adds to the blur.
+    float blur_noise;
+    float blur_pad0;
+    float blur_pad1;
 };
 
 struct BlurVertexOutput {
@@ -1363,6 +1393,45 @@ BlurCompositeVertexOutput blur_composite_vertex(uint vertex_id: SV_VertexID) {
     return output;
 }
 
+// How much of the composite a fragment at `position` takes: the opacity, times the coverage of
+// the rounded rect for a backdrop. The content mask clips it with SV_ClipDistance.
+float blur_composite_weight(float2 position) {
+    Corners radii;
+    radii.top_left = blur_corner_radii.x;
+    radii.top_right = blur_corner_radii.y;
+    radii.bottom_right = blur_corner_radii.z;
+    radii.bottom_left = blur_corner_radii.w;
+    float distance = quad_sdf(position, blur_bounds, radii);
+    // Backdrop clips to the rounded rect (the panel has a defined shape); content blur bleeds past
+    // its bounds like CSS `filter: blur`, so its shape comes from the blurred group's own alpha.
+    float coverage = blur_clip_rounded > 0.5 ? saturate(0.5 - distance) : 1.0;
+    return coverage * blur_opacity;
+}
+
+// Sin-less white noise by David Hoskins (MIT License), https://www.shadertoy.com/view/4djSRW,
+// as niri's blur uses it: a value in [0, 1) for each pixel position.
+float blur_noise_hash(float2 p) {
+    float3 p3 = frac(p.xyx * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+// What a compositor does to a blur besides blurring, as niri does to the blur behind a window:
+// scales its saturation around its Rec. 709 luma, as CSS `saturate()` does, and adds white noise
+// that breaks up its banding. `color` is premultiplied, and both are linear in it, so they scale
+// with its alpha; the result stays a valid premultiplied color.
+float4 blur_adjust(float4 color, float2 position) {
+    float3 rgb = color.rgb;
+    if (blur_saturation != 1.0) {
+        float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        rgb = lerp(float3(luma, luma, luma), rgb, blur_saturation);
+    }
+    if (blur_noise > 0.0) {
+        rgb += (blur_noise_hash(position) - 0.5) * blur_noise * color.a;
+    }
+    return float4(clamp(rgb, float3(0.0, 0.0, 0.0), float3(color.a, color.a, color.a)), color.a);
+}
+
 float4 blur_composite_fragment(BlurCompositeFragmentInput input): SV_Target {
     // Sample the half-res blur by screen position, on the SAME fixed 2:1 grid the snapped downsample
     // wrote (anchored at the origin, independent of viewport parity): 2 * the half-res texture size
@@ -1370,20 +1439,24 @@ float4 blur_composite_fragment(BlurCompositeFragmentInput input): SV_Target {
     uint hw, hh;
     t_sprite.GetDimensions(hw, hh);
     float2 uv = input.position.xy / (2.0 * float2(hw, hh));
-    float4 blurred = t_sprite.SampleLevel(s_sprite, uv, 0.0);
-    Corners radii;
-    radii.top_left = blur_corner_radii.x;
-    radii.top_right = blur_corner_radii.y;
-    radii.bottom_right = blur_corner_radii.z;
-    radii.bottom_left = blur_corner_radii.w;
-    float distance = quad_sdf(input.position.xy, blur_bounds, radii);
-    // Backdrop clips to the rounded rect (the panel has a defined shape); content blur bleeds past
-    // its bounds like CSS `filter: blur`, so its shape comes from the blurred group's own alpha.
-    float coverage = blur_clip_rounded > 0.5 ? saturate(0.5 - distance) : 1.0;
+    float4 blurred = blur_adjust(t_sprite.SampleLevel(s_sprite, uv, 0.0), input.position.xy);
     // The blurred sample is premultiplied (blurring against the transparent surround scales rgb
-    // with the fading alpha), so output premultiplied and use a premultiplied-blend state. A
-    // backdrop's scene is opaque (so this replaces); a content-filter group is transparent outside
-    // its subtree (so the target shows through there instead of darkening).
-    float a = coverage * blur_opacity;
+    // with the fading alpha), so output premultiplied. A content-filter group is transparent
+    // outside its subtree, and its blend state blends it over the target, which shows through
+    // there instead of darkening. A backdrop's blend state adds it to the target that
+    // `blur_backdrop_erase_fragment` faded by the same weight.
+    float a = blur_composite_weight(input.position.xy);
     return float4(blurred.rgb * a, blurred.a * a);
+}
+
+// The first half of a backdrop's composite: fades the target by the weight of the blurred
+// backdrop, which `blur_composite_fragment` then adds, so that the result is the mix of the two.
+// Blending the blur over the backdrop instead would stack the two where the backdrop is
+// translucent, as in a transparent window, and make it more opaque than it is.
+BlurCompositeVertexOutput blur_backdrop_erase_vertex(uint vertex_id: SV_VertexID) {
+    return blur_composite_vertex(vertex_id);
+}
+
+float4 blur_backdrop_erase_fragment(BlurCompositeFragmentInput input): SV_Target {
+    return float4(0.0, 0.0, 0.0, blur_composite_weight(input.position.xy));
 }

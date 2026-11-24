@@ -1015,11 +1015,14 @@ impl PlatformWindow for WindowsWindow {
     fn draw(&self, scene: &Scene) {
         #[cfg(not(feature = "wgpu"))]
         {
-            self.state
-                .renderer
-                .borrow_mut()
+            let mut renderer = self.state.renderer.borrow_mut();
+            renderer
                 .draw(scene, self.state.background_appearance.get())
                 .log_err();
+            // A cached offscreen surface lost its texture: render again, repainting them all.
+            if renderer.needs_redraw() {
+                self.state.force_render_after_recovery.set(true);
+            }
         }
 
         #[cfg(feature = "wgpu")]

@@ -142,10 +142,16 @@ impl WindowsWindowState {
             Rc::new(RefCell::new(None)),
             &RawWindow { hwnd },
             WgpuSurfaceConfig {
-                size: physical_size,
+                // `CW_USEDEFAULT` (`i32::MIN`) where the system places the window: the first
+                // `WM_SIZE` sizes the surface, as it does the DirectX renderer's 1x1 one.
+                size: size(
+                    DevicePixels(physical_size.width.0.max(1)),
+                    DevicePixels(physical_size.height.0.max(1)),
+                ),
                 transparent: false,
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             },
+            None,
             None,
         )
         .context("Creating Wgpu renderer")?;
